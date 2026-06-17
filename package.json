@@ -1,0 +1,14 @@
+{
+  "name": "project-bar-shell",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Tauri shell for Project Bar — loads the GitHub Pages track UI. The web UI itself stays framework-free and build-step-free (index.html).",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

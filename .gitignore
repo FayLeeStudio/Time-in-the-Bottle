@@ -1,0 +1,10 @@
+# Node / Tauri CLI tooling (shell only — the web UI has no build step)
+node_modules/
+
+# Rust / Tauri build artifacts
+src-tauri/target/
+src-tauri/gen/
+
+# OS
+Thumbs.db
+.DS_Store
