@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "identifier": "design.indiegames.project-bar",
   "build": {
-    "frontendDist": "../"
+    "frontendDist": "../dist"
   },
   "app": {
     "withGlobalTauri": true,
