@@ -8,14 +8,15 @@ const ROOM = "SMOKE" + Date.now().toString(36).slice(-4); // fresh room each run
 let pass = 0, fail = 0;
 const ok = (c, m) => { (c ? pass++ : fail++); console.log((c ? "  ok  " : " FAIL ") + m); };
 
-function open(pk) {
-  const ws = new WebSocket(`${WSPROTO}://${HOST}/parties/main/${ROOM}?_pk=${pk}`);
+function open(pk, room = ROOM) {
+  const ws = new WebSocket(`${WSPROTO}://${HOST}/parties/main/${room}?_pk=${pk}`);
   const states = [];
   ws.addEventListener("message", (e) => states.push(JSON.parse(e.data)));
   return Object.assign(ws, {
     states,
     ready: new Promise((res, rej) => { ws.addEventListener("open", res); ws.addEventListener("error", rej); }),
     last: () => states[states.length - 1],
+    lastFrozen: () => { for (let i = states.length - 1; i >= 0; i--) if (states[i].frozenBands) return states[i]; return null; },
     // resolve once any received state matches `pred`, or after `ms`
     until: (pred, ms = 4000) => new Promise((res) => {
       const t0 = Date.now();
@@ -50,7 +51,7 @@ const main = async () => {
 
   await p1.until((s) => s.players && Object.keys(s.players).length === 4);
   ok(Object.keys(p1.last().players).length === 4, "p1 sees 4 players");
-  ok(Array.isArray(p1.last().frozenBands), "state carries a frozenBands array");
+  ok(Array.isArray((p1.lastFrozen() || {}).frozenBands), "initial snapshot carries a frozenBands array");
 
   // 2) a 5th NEW player is bounced with room_full (over the WS, not a 403 body)
   const p5 = open("p5"); await p5.ready; join(p5, "P5");
@@ -76,7 +77,26 @@ const main = async () => {
   ok(p6.last().type !== "error", "new player joins after a leave");
   ok(colorOf(p6.last(), "p6") === "violet", "freed colour (violet) reused by p6");
 
-  console.log(`\n${fail ? "x" : "+"} ${pass} passed, ${fail} failed (room ${ROOM})`);
+  // 6) frozen-band sync — seq-guarded first-write-wins (fresh room)
+  const R2 = "FRZ" + Date.now().toString(36).slice(-4);
+  const f1 = open("f1", R2); await f1.ready; join(f1, "F1");
+  await f1.until((s) => colorOf(s, "f1"));
+  f1.send(JSON.stringify({ type: "freeze", seq: 0, band: "AAA" }));
+  await f1.until((s) => s.frozenBands && s.frozenBands.length === 1);
+  ok(f1.lastFrozen().frozenBands[0] === "AAA", "freeze seq0 accepted (history=[AAA])");
+  const f2 = open("f2", R2); await f2.ready; join(f2, "F2");
+  await f2.until((s) => colorOf(s, "f2"));
+  f2.send(JSON.stringify({ type: "freeze", seq: 0, band: "BBB" })); // stale seq → dropped
+  await sleep(600);
+  ok(f1.lastFrozen().frozenBands.length === 1, "stale seq0 rejected (BBB dropped, first-write-wins)");
+  f1.send(JSON.stringify({ type: "freeze", seq: 1, band: "CCC" }));
+  await f1.until((s) => s.frozenBands && s.frozenBands.length === 2);
+  ok(f1.lastFrozen().frozenBands[1] === "CCC", "freeze seq1 accepted (history=[AAA,CCC])");
+  const f3 = open("f3", R2); await f3.ready; join(f3, "F3");
+  const snap = await f3.until((s) => s.frozenBands && s.frozenBands.length === 2);
+  ok(snap && snap.frozenBands.join() === "AAA,CCC", "new joiner snapshot carries frozen history");
+
+  console.log(`\n${fail ? "x" : "+"} ${pass} passed, ${fail} failed (rooms ${ROOM} + ${R2})`);
   process.exit(fail ? 1 : 0);
 };
 const mini = async () => {

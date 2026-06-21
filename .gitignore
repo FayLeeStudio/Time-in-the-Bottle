@@ -6,6 +6,9 @@ node_modules/
 # stale PartyKit local state (backend migrated off PartyKit; ignore leftovers)
 .partykit/
 
+# Authoritative server's per-room snapshots (runtime state, not source)
+server/data/
+
 # Rust / Tauri build artifacts
 src-tauri/target/
 src-tauri/gen/

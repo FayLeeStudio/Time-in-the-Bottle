@@ -120,7 +120,7 @@ export class RaceRoom {  // legacy class name, kept to match the live deployment
   }
 
   onMessage(id: string, raw: unknown) {
-    let data: { type?: string; name?: string; ticks?: number; band?: unknown };
+    let data: { type?: string; name?: string; ticks?: number; seq?: number; band?: string };
     try { data = JSON.parse(typeof raw === "string" ? raw : ""); } catch { return; }
 
     if (data.type === "join") {
@@ -131,19 +131,28 @@ export class RaceRoom {  // legacy class name, kept to match the live deployment
         this.players[id].name = String(data.name); // returning player may rename
       }
       this.persist();
-      this.broadcast();
+      this.broadcast(); // players only — newcomer already got frozenBands in its snapshot
     } else if (data.type === "progress" && this.players[id]) {
       // ticks live in memory during the session (the DO stays alive while any
       // socket is open); we persist on join/leave/disconnect, NOT on every 10fps
       // tick. A reconnecting client re-reports its true count anyway.
       this.players[id].ticks = Number(data.ticks) || 0;
-      this.broadcast();
+      this.broadcast(); // players only — keep frozen history off the 10fps stream
+    } else if (data.type === "freeze" && this.players[id]) {
+      // Seq-guarded first-write-wins: accept a band only if its index is exactly
+      // the next free slot. A loser's seq won't match (someone already took it),
+      // so it's silently dropped — that client adopts the authoritative band from
+      // the broadcast below. The band is opaque; the server never parses it.
+      if (typeof data.seq === "number" && data.seq === this.frozenBands.length && typeof data.band === "string") {
+        this.frozenBands.push(data.band);
+        this.persist();
+        this.broadcast(true); // include the now-longer authoritative history
+      }
     } else if (data.type === "leave") {
       // explicit exit: free the slot + colour. (Just closing the app/window does
       // NOT come here — that's onClose, which keeps you on file.)
       if (this.players[id]) { delete this.players[id]; this.persist(); this.broadcast(); }
     } else {
-      // Phase B will add: type === "freeze" → push opaque band, persist, broadcast.
       return; // unknown / invalid → no broadcast
     }
   }
@@ -156,10 +165,13 @@ export class RaceRoom {  // legacy class name, kept to match the live deployment
     if (id && this.players[id]) this.persist();
   }
 
-  broadcast() {
-    // Phase A frozenBands is empty so this is cheap; Phase B should split the
-    // (large, rarely-changing) frozen history out of the 10fps progress stream.
-    const msg = JSON.stringify({ type: "state", players: this.players, frozenBands: this.frozenBands });
+  // High-frequency updates (join/progress/leave) send players only; the frozen
+  // history (large, rarely changes) rides along ONLY when it actually grew
+  // (freeze) or for a newcomer's initial snapshot. Keeps the 10fps stream small.
+  broadcast(withFrozen = false) {
+    const payload: Record<string, unknown> = { type: "state", players: this.players };
+    if (withFrozen) payload.frozenBands = this.frozenBands;
+    const msg = JSON.stringify(payload);
     for (const ws of this.conns.keys()) {
       try { ws.send(msg); } catch { /* dead socket; its close handler cleans up */ }
     }

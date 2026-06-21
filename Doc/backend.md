@@ -1,7 +1,6 @@
 # Time in the Bottle — 后端规范
 
-> 本文件定义 **Cloudflare Workers + Durable Objects 后端的协议、结构和部署方式**。
-> 系统架构背景见 `architecture.md`。
+> ⚠️ **2026-06-21 架构转向**：后端从 Cloudflare Workers+DO（中继 ticks）改为**常驻 Node 服务 + 服务端权威物理**。本文件下方描述的 DO 协议 / 结构 / 部署**已整体作废**，新协议（输入上报 + 网格增量广播 + 存盘）随阶段 1 实现一并重写。架构背景见 `architecture.md`、`CLAUDE.md`。
 
 ---
 

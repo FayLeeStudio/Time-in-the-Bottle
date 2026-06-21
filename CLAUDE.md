@@ -12,9 +12,17 @@
 
 ---
 
+## 架构转向（2026-06-21）
+
+原设计是**客户端本地物理 + 服务端只传整数 `ticks`**。但多人场景下，各客户端本地模拟会因随机滑落而**发散**，无法保证"同房间所有人看到一致的画面"，且"已落定但未冻结的沙"没有单一权威、难以作为房间存档持久化。
+
+故决定转向 **服务端权威物理（server-authoritative）**：沙粒模拟在服务端运行并持有唯一真相，客户端只发输入、收状态、纯渲染。下方不变量已据此更新；被替换的旧条款（客户端本地物理、后端只传 `ticks`、Cloudflare Workers+DO）**作废**。
+
+---
+
 ## 核心不变量
 
-1. **沙粒物理在客户端本地计算。** 服务端只传递整数 `ticks`（击键次数），**绝不**传递沙粒坐标、颜色或物理状态。各客户端根据 ticks 自行驱动本地像素沙模拟。
+1. **服务端权威物理。** falling-sand 模拟在**服务端**运行（每房间一个），服务端持有完整网格（grid）= 房间唯一真相，并负责持久化。客户端**不跑权威物理**：只上报输入（整数计数 / 交互事件），接收服务端广播的网格状态，**纯渲染**。同房间所有客户端显示同一份权威画布。
 
 2. **UI 与外壳解耦，方向不可反。**
    - `index.html` = 纯 Web（无框架、无构建步骤），托管在 GitHub Pages，任意设备可改。
@@ -23,10 +31,10 @@
 
 3. **原生边界。**
    - 全局输入统计**只在 Rust 层**做（rdev），webview **永不**直接读全局输入。
-   - webview 只通过 Tauri 事件 `keycount` 接收整数计数，再驱动沙粒生成。
-   - 隐私红线：**只对输入计数**，绝不记录具体键位内容，绝不记录输入文本。
+   - webview 只通过 Tauri 事件 `keycount` 接收整数计数，再**作为输入上报给服务端**（不在本地决定沙粒落点）。
+   - 隐私红线：**只对输入计数**，绝不记录具体键位内容，绝不记录输入文本——**客户端、服务端、存档一律不得出现键位内容**。
 
-4. **后端 = Cloudflare Workers + Durable Objects。** 后端只做一件事：把某玩家的整数 `ticks` 广播给同房间所有人。**不感知沙粒状态，不感知物理模拟。** 完整协议见 `doc/backend.md`。
+4. **后端 = 常驻服务（Node + ws）。** 后端运行物理模拟、持有并持久化每个房间的网格、向同房间广播网格状态（增量优先）。部署在**海外位置**的 VPS（可用大陆厂商的香港/新加坡等海外节点），保证大陆与海外都可连。完整协议、状态结构与部署见 `doc/backend.md`。
 
 5. **无构建步骤约束。** 纯 HTML/CSS/vanilla JS，不引入前端框架或构建工具，保持 GitHub Pages 可直接编辑。除非显式批准，否则此约束不可更改。
 
@@ -38,33 +46,35 @@
 - **Tauri 不跨平台编译**：Windows 包在 Windows 上构建，macOS 包在 macOS 上构建（或用 CI）。
 - UI 层（网页）跨平台免费，两端渲染一致。
 - macOS 额外项（以后处理）：透明需 `macOSPrivateApi: true`；全局输入需"输入监控"授权。
+- **后端是常驻进程**，部署在海外位置的 VPS；本地开发用 `node server` 起 localhost 实例联调。
 
 ---
 
 ## 仓库结构
 
 ```
-index.html          # 主 UI（纯 Web，Pages 托管）
+index.html          # 主 UI（纯 Web 渲染，Pages 托管）
 README.md
 CLAUDE.md           # 本契约（必读）
 doc/
   game-design.md    # 游戏设计：玩法、成就系统、游戏化机制
   frontend.md       # 前端设计：CSS 变量、组件、动效、canvas 规格
   architecture.md   # 系统架构：分层、数据流、技术选型
-  backend.md        # 后端规范：协议、DO 结构、部署
+  backend.md        # 后端规范：协议、状态结构、部署
   hardware.md       # 硬件接口（预留）
-package.json        # Tauri CLI + wrangler 工具
+package.json        # Tauri CLI + 后端服务脚本
 src-tauri/          # Tauri 外壳（本地构建）
-party/server.ts     # Cloudflare Worker + Durable Object
-wrangler.toml       # Cloudflare Workers 部署配置
+server/             # 常驻后端服务（Node + ws，权威物理）
 ```
+
+> 旧的 `party/server.ts`（Cloudflare Worker + DO）与 `wrangler.toml` 在转向后**作废**，由 `server/` 取代。
 
 ---
 
 ## 给 Claude Code 的护栏
 
 - **不要**给网页 UI 引入前端框架或构建步骤。
-- **不要**把输入统计逻辑搬进 webview。
-- **不要**让后端感知沙粒状态或物理模拟；后端只传整数 `ticks`。
-- **不要**在服务端存储或传输任何键位内容。
+- **不要**把输入统计逻辑搬进 webview（仍只在 Rust/rdev）。
+- **不要**让客户端自行计算权威物理、或维护一套与服务端冲突的画布状态；客户端只渲染服务端广播的网格。
+- **不要**在服务端（或任何环节）存储或传输任何键位内容——只存计数与网格像素，绝无文本。
 - 改动 `doc/architecture.md` 中的技术选型前，必须先说明理由并等待确认。
