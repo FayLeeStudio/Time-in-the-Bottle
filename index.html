@@ -333,16 +333,20 @@
   const demoMode = params.has("demo");
 
   // ---------------------------------------------------------------------------
-  // Identity palette. Grid cells hold a slot index (1..4); 0 = empty. The four
-  // identity colours are fixed regardless of how many people are pouring, so a
-  // given slot always renders the same hue. (Stage 2: >4 players recycle 2..4.)
+  // Identity palette. Grid cells hold a slot index (1..4); 0 = empty. Colour is
+  // an OBJECTIVE, server-assigned property of each player (Doc/frontend.md): the
+  // same player renders the same hue on every client, so a frozen snapshot means
+  // the same thing everywhere. "Which one is me" is shown by a label, not colour.
   // ---------------------------------------------------------------------------
   const USER_COLORS = [
-    { css: "#e0a24e", rgb: [224, 162, 78]  }, // slot 1 — you (amber)
+    { css: "#e0a24e", rgb: [224, 162, 78]  }, // slot 1 — amber
     { css: "#46b6a6", rgb: [70, 182, 166]  }, // slot 2 — teal
     { css: "#9c82dd", rgb: [156, 130, 221] }, // slot 3 — violet
     { css: "#de6e92", rgb: [222, 110, 146] }, // slot 4 — rose
   ];
+  // Server colour name → slot / grid value. Must match the server's ROOM_COLORS.
+  const COLOR_NAMES = ["amber", "teal", "violet", "rose"];
+  function colorToSlot(c) { const i = COLOR_NAMES.indexOf(c); return i >= 0 ? i + 1 : 1; }
 
   // --- sand-engine constants (Doc/frontend.md · sand spec) ---
   const W         = 80;    // grid columns (80 * 3 = 240px — matches the menu width)
@@ -374,7 +378,9 @@
   let youBaselineSet = false; // first keycount sets a baseline (no grain dump)
   let pendingTicks = null;    // latest cumulative ticks awaiting report to the room
 
-  // Active pourers. Stage 1: just You. Each entry maps to one identity slot.
+  // Active pourers. `you` starts on a TENTATIVE amber slot — fine offline and
+  // before joining a room; once the room hands us our objective colour we remap
+  // to it (remapMySlot). `slot` doubles as the grid value (1..4).
   const you = {
     id: "you", name: "You", you: true, slot: 1, x: 40,
     count: 0, queue: 0,
@@ -729,7 +735,7 @@
     barEl.appendChild(fill);
     row.appendChild(head); row.appendChild(barEl);
     rankingEl.appendChild(row);
-    u.rowEl = row; u.countEl = cnt; u.barEl = fill;
+    u.rowEl = row; u.countEl = cnt; u.barEl = fill; u.swatchEl = sw; u.nameEl = nm;
   }
 
   function updateChrome() {
@@ -740,6 +746,7 @@
     for (const u of users) if (u.count > max) max = u.count;
     for (const u of users) {
       ensureRow(u);
+      if (u.nameEl && u.nameEl.textContent !== u.name) u.nameEl.textContent = u.name; // remote may rename
       u.countEl.textContent = u.count.toLocaleString();
       u.barEl.style.width = Math.max(3, Math.round((u.count / max) * 100)) + "%";
     }
@@ -901,11 +908,17 @@
                makeRoomCode();
   localStorage.setItem("titb.room", roomId);
 
-  // Bring our own connection id (?_pk): we recognise and skip our own grains in
-  // the broadcast without any server-side help.
-  const myId = (window.crypto && crypto.randomUUID)
-    ? crypto.randomUUID()
-    : (Date.now().toString(36) + Math.random().toString(36).slice(2));
+  // Our PERSISTENT playerId (?_pk). It MUST be stored and reused across reloads
+  // and restarts: that's how the room recognises "the same person came back"
+  // instead of burning a fresh slot every time (which would exhaust the 4-cap).
+  // We also use it to skip our own record in the broadcast.
+  function freshId() {
+    return (window.crypto && crypto.randomUUID)
+      ? crypto.randomUUID()
+      : (Date.now().toString(36) + Math.random().toString(36).slice(2));
+  }
+  let myId = localStorage.getItem("titb.playerId");
+  if (!myId) { myId = freshId(); localStorage.setItem("titb.playerId", myId); }
   let playerName = localStorage.getItem("titb.name") || ("玩家-" + myId.slice(0, 4));
 
   // Backend host: local wrangler dev (127.0.0.1:8787) when running from
@@ -920,43 +933,57 @@
                      (isDev ? "127.0.0.1:8787" : PROD_HOST);
   const wsProto = /^(localhost|127\.0\.0\.1)/.test(PARTY_HOST) ? "ws" : "wss";
 
-  // slot bookkeeping: you = slot 1; remotes take 2..4, recycling once full.
+  // Spout x per slot (1..4). A player's slot = their server-assigned colour, so
+  // it's globally consistent — no local slot allocation any more.
   const SPOUT_X = { 1: 40, 2: 15, 3: 57, 4: 72 };
-  const remoteUsers = Object.create(null); // connId -> user object (also in `users`)
-  const usedSlots = new Set([1]);
-  function takeSlot() {
-    for (let s = 2; s <= 4; s++) if (!usedSlots.has(s)) { usedSlots.add(s); return s; }
-    return 2 + (Object.keys(remoteUsers).length % 3); // recycle 2..4 beyond four
-  }
+  const remoteUsers = Object.create(null); // playerId -> user object (also in `users`)
   function removeRemote(id) {
     const u = remoteUsers[id];
     if (!u) return;
     const ix = users.indexOf(u); if (ix > 0) users.splice(ix, 1);
     if (u.rowEl) u.rowEl.remove();
     delete remoteUsers[id];
-    if (u.slot >= 2 && u.slot <= 4) {
-      let stillUsed = false;
-      for (const k in remoteUsers) if (remoteUsers[k].slot === u.slot) stillUsed = true;
-      if (!stillUsed) usedSlots.delete(u.slot);
-    }
   }
   function clearRemotes() { for (const id in remoteUsers) removeRemote(id); }
+
+  // Recolour our own sand when the room assigns us a colour different from the
+  // tentative amber we poured with offline. Cheap: one pass over the active grid
+  // + any local frozen bands (Phase A frozen bands are still local). The server
+  // hands out unique colours, so no remote ever shares our slot.
+  function remapMySlot(newSlot) {
+    const old = you.slot;
+    if (!newSlot || newSlot === old) return;
+    for (let i = 0; i < grid.length; i++) if (grid[i] === old) grid[i] = newSlot;
+    for (const b of frozen) for (let i = 0; i < b.length; i++) if (b[i] === old) b[i] = newSlot;
+    you.slot = newSlot;
+    you.css = USER_COLORS[newSlot - 1].css;
+    you.x = SPOUT_X[newSlot] || 40;
+    if (you.swatchEl) { you.swatchEl.style.background = you.css; you.barEl.style.background = you.css; }
+  }
 
   function applyState(players) {
     const seen = Object.create(null);
     for (const id in players) {
-      if (id === myId) continue; // our own pour is local
-      seen[id] = true;
       const p = players[id] || {};
+      if (id === myId) {
+        // our own pour is local — we only learn our OBJECTIVE colour here and
+        // remap our tentative sand to it (count/queue stay locally driven).
+        if (p.color && p.color !== "auto") remapMySlot(colorToSlot(p.color));
+        continue;
+      }
+      seen[id] = true;
       const t = Number(p.ticks) || 0;
+      const slot = colorToSlot(p.color);
       let u = remoteUsers[id];
       if (!u) {
-        const slot = takeSlot();
         u = { id: id, name: p.name || "玩家", you: false, slot: slot,
               x: SPOUT_X[slot] || 45, css: USER_COLORS[slot - 1].css,
               count: t, queue: 0, lastTicks: t }; // baseline: don't dump backlog
         remoteUsers[id] = u;
         users.push(u);
+      } else if (slot !== u.slot) {                 // colour (re)assigned by server
+        u.slot = slot; u.x = SPOUT_X[slot] || 45; u.css = USER_COLORS[slot - 1].css;
+        if (u.swatchEl) { u.swatchEl.style.background = u.css; u.barEl.style.background = u.css; }
       }
       if (p.name) u.name = p.name;
       const delta = t - u.lastTicks;
@@ -968,20 +995,34 @@
 
   let ws = null;
   let reconnectTimer = null;
+  let roomFull = false; // set when the room bounced us at 4 players; suppresses
+                        // the reconnect storm until the user switches rooms
   function setLive(ok) { if (liveDot) liveDot.classList.toggle("off", !ok); } // room-server connection status
+  function showRoomFull() {
+    roomFull = true;
+    setLive(false);
+    if (roomCodeEl) { roomCodeEl.textContent = "FULL"; setTimeout(updateRoomLabel, 2500); }
+    if (typeof console !== "undefined") console.warn("[titb] room is full (max 4 players)");
+  }
   function sendJoin() {
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "join", name: playerName }));
+      ws.send(JSON.stringify({ type: "join", name: playerName, color: "auto" }));
       pendingTicks = you.count; // sync our current count on entry
     }
   }
   function onWsMessage(e) {
     let data; try { data = JSON.parse(e.data); } catch (_) { return; }
-    if (data && data.type === "state") applyState(data.players || {});
+    if (!data) return;
+    if (data.type === "error") { if (data.reason === "room_full") showRoomFull(); return; }
+    if (data.type === "state") {
+      applyState(data.players || {});
+      // data.frozenBands: Phase B will render the room's frozen history here.
+    }
   }
   function scheduleReconnect() {
     ws = null;
     setLive(false);
+    if (roomFull) return;       // don't hammer a full room; wait for a room switch
     if (reconnectTimer) return;
     reconnectTimer = setTimeout(function () { reconnectTimer = null; connect(); }, 2000);
   }
@@ -1016,12 +1057,19 @@
 
   // --- room controls (menu) ---
   function updateRoomLabel() { if (roomCodeEl) roomCodeEl.textContent = roomId; }
+  function sendLeave() {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      try { ws.send(JSON.stringify({ type: "leave" })); } catch (_) {}
+    }
+  }
   function switchRoom(code) {
     const r = normRoom(code);
     if (!r || r === roomId) return;
+    sendLeave();          // intentionally leaving the old room frees our slot there
     roomId = r;
     localStorage.setItem("titb.room", roomId);
-    clearRemotes(); usedSlots.clear(); usedSlots.add(1);
+    clearRemotes();
+    roomFull = false;     // new room → allow connecting again
     updateRoomLabel();
     reconnect();
   }

@@ -1,18 +1,26 @@
-// Time in the Bottle — room relay backend (Stage 2).
+// Time in the Bottle — room backend (Stage 2, Phase A).
 //
 // History: originally planned on PartyKit's hosted cloud, but its shared domain
 // `partykit.dev` hit Cloudflare's hard limit of 10,000 custom domains per zone,
 // so new free deploys are blocked (2026-06). PartyKit is itself a thin wrapper
 // over Cloudflare Durable Objects, so we run that directly: free, always-on, no
-// custom domain needed (uses *.workers.dev). The job is unchanged — relay each
-// player's integer `ticks` (their cumulative keystroke count) to the room; it
-// never knows the sand grid, colours, or physics. See Doc/backend.md and
-// Doc/architecture.md.
+// custom domain needed (uses *.workers.dev). See Doc/backend.md, Doc/architecture.md.
 //
-// Routing: wss://<host>/parties/main/<roomId>?_pk=<connId>
+// What the room does NOW (Phase A): relay each player's integer `ticks` (their
+// cumulative keystroke count) AND keep a persistent room:
+//   · players persist in DO storage — offline ≠ exit; reconnecting keeps your
+//     identity, colour and last-known count. Only an explicit `leave` removes you.
+//   · the server assigns each player an objective colour (amber/teal/violet/rose);
+//     every client renders the same colour for the same player.
+//   · max 4 players; a 5th NEW player is bounced with reason "room_full".
+// It still never runs physics or understands the sand grid — it only stores and
+// forwards integers (and, in Phase B, opaque frozen-band snapshots it never parses).
+//
+// Routing: wss://<host>/parties/main/<roomId>?_pk=<playerId>
 //   · each roomId maps to one Durable Object instance (= one room),
-//   · the client supplies its own connection id via ?_pk, so it can recognise
-//     and skip its own grains in the broadcast (no server-side help needed).
+//   · `_pk` is the client's PERSISTENT playerId (stored in localStorage and
+//     reused across reconnects) — this is how the room tells "an old player came
+//     back" from "a new player wants in".
 
 export interface Env {
   // Binding kept as RACEROOM/RaceRoom to match the already-deployed worker; the
@@ -36,33 +44,75 @@ export default {
   },
 };
 
-type PlayerState = { name: string; ticks: number };
+type PlayerState = { name: string; color: string; ticks: number };
 
-// One instance per roomId. Holds the room's players in memory and rebroadcasts
-// the full state on every change — same contract as the old PartyKit server.
+// Objective identity colours, slot order 1..4. The client maps the same names to
+// the same grid values / hues, so a snapshot means the same thing everywhere.
+const ROOM_COLORS = ["amber", "teal", "violet", "rose"];
+const ROOM_CAP = 4;
+
+// One instance per roomId. Players + frozen bands live in DO storage (the DO can
+// be evicted when idle, so in-memory fields are just a hot cache of storage).
 export class RaceRoom {  // legacy class name, kept to match the live deployment
   players: Record<string, PlayerState> = {};
-  conns: Map<WebSocket, string> = new Map(); // socket -> connId
+  frozenBands: unknown[] = [];           // append-only, opaque; Phase B fills this
+  conns: Map<WebSocket, string> = new Map(); // socket -> playerId (routing only)
+  state: DurableObjectState;
 
-  constructor(_state: DurableObjectState, _env: Env) {}
+  constructor(state: DurableObjectState, _env: Env) {
+    this.state = state;
+    // Load storage before any fetch runs — storage is the source of truth.
+    state.blockConcurrencyWhile(async () => {
+      this.players = ((await state.storage.get("players")) as Record<string, PlayerState>) || {};
+      this.frozenBands = ((await state.storage.get("frozenBands")) as unknown[]) || [];
+    });
+  }
+
+  persist() {
+    // Fire-and-forget; the DO output gate keeps writes ordered + consistent.
+    this.state.storage.put("players", this.players);
+    this.state.storage.put("frozenBands", this.frozenBands);
+  }
+
+  takeColor(): string {
+    const used = new Set(Object.values(this.players).map((p) => p.color));
+    for (const c of ROOM_COLORS) if (!used.has(c)) return c;
+    return ROOM_COLORS[0]; // unreachable under the 4-cap
+  }
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
-    const connId = url.searchParams.get("_pk") || crypto.randomUUID();
+    const playerId = url.searchParams.get("_pk") || crypto.randomUUID();
+    const isNew = !this.players[playerId];
 
     const pair = new WebSocketPair();
     const client = pair[0];
     const server = pair[1];
     server.accept();
-    this.conns.set(server, connId);
 
-    // snapshot so the newcomer immediately sees everyone already in the room
-    server.send(JSON.stringify({ type: "state", players: this.players }));
+    // Reject a 5th NEW player. We accept the socket first, then send the reason
+    // and close — a browser WebSocket can't read an HTTP 403 body, so this is the
+    // only way the client actually learns *why* it bounced. Returning players
+    // (their playerId is already on file) are never blocked, even at 4.
+    if (isNew && Object.keys(this.players).length >= ROOM_CAP) {
+      server.send(JSON.stringify({ type: "error", reason: "room_full" }));
+      server.close(4001, "room_full");
+      return new Response(null, { status: 101, webSocket: client });
+    }
+
+    this.conns.set(server, playerId);
+
+    // snapshot so the newcomer immediately sees everyone + the frozen history
+    server.send(JSON.stringify({
+      type: "state",
+      players: this.players,
+      frozenBands: this.frozenBands,
+    }));
 
     server.addEventListener("message", (e: MessageEvent) => {
-      this.onMessage(connId, e.data);
+      this.onMessage(playerId, e.data);
     });
-    const drop = () => this.onClose(server, connId);
+    const drop = () => this.onClose(server);
     server.addEventListener("close", drop);
     server.addEventListener("error", drop);
 
@@ -70,28 +120,46 @@ export class RaceRoom {  // legacy class name, kept to match the live deployment
   }
 
   onMessage(id: string, raw: unknown) {
-    let data: { type?: string; name?: string; ticks?: number };
+    let data: { type?: string; name?: string; ticks?: number; band?: unknown };
     try { data = JSON.parse(typeof raw === "string" ? raw : ""); } catch { return; }
+
     if (data.type === "join") {
-      this.players[id] = { name: String(data.name ?? "Player"), ticks: 0 };
+      if (!this.players[id]) {
+        // first time in this room → build a profile + assign an objective colour
+        this.players[id] = { name: String(data.name ?? "Player"), color: this.takeColor(), ticks: 0 };
+      } else if (data.name != null) {
+        this.players[id].name = String(data.name); // returning player may rename
+      }
+      this.persist();
+      this.broadcast();
     } else if (data.type === "progress" && this.players[id]) {
-      this.players[id].ticks = Number(data.ticks) || 0; // trust the client's int
+      // ticks live in memory during the session (the DO stays alive while any
+      // socket is open); we persist on join/leave/disconnect, NOT on every 10fps
+      // tick. A reconnecting client re-reports its true count anyway.
+      this.players[id].ticks = Number(data.ticks) || 0;
+      this.broadcast();
+    } else if (data.type === "leave") {
+      // explicit exit: free the slot + colour. (Just closing the app/window does
+      // NOT come here — that's onClose, which keeps you on file.)
+      if (this.players[id]) { delete this.players[id]; this.persist(); this.broadcast(); }
     } else {
-      return; // unknown / invalid message → no broadcast
+      // Phase B will add: type === "freeze" → push opaque band, persist, broadcast.
+      return; // unknown / invalid → no broadcast
     }
-    this.broadcast();
   }
 
-  onClose(ws: WebSocket, id: string) {
+  onClose(ws: WebSocket) {
+    const id = this.conns.get(ws);
     this.conns.delete(ws);
-    if (this.players[id]) {
-      delete this.players[id];
-      this.broadcast();
-    }
+    // Keep the player record (offline ≠ exit). Persist so the last-known ticks
+    // survive a later DO eviction; everyone still sees them in the ranking.
+    if (id && this.players[id]) this.persist();
   }
 
   broadcast() {
-    const msg = JSON.stringify({ type: "state", players: this.players });
+    // Phase A frozenBands is empty so this is cheap; Phase B should split the
+    // (large, rarely-changing) frozen history out of the 10fps progress stream.
+    const msg = JSON.stringify({ type: "state", players: this.players, frozenBands: this.frozenBands });
     for (const ws of this.conns.keys()) {
       try { ws.send(msg); } catch { /* dead socket; its close handler cleans up */ }
     }
