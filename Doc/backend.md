@@ -45,13 +45,17 @@ ws://<host>/r/<roomId>?_pk=<playerId>
 ### 服务端 → 客户端
 
 ```ts
-// 加入时：完整状态
-{ type:"snapshot", w:80, h:200,
+// 加入时：完整状态（含归档带 bands，见 Stage 3）
+{ type:"snapshot", w:80, h:300,
   players:{ "<id>":{ name, color, ticks }, ... },
-  grid:"<base64 of W*H bytes>" }
+  grid:"<base64 of W*H bytes>",
+  bands:[ { rows, n, cols:"<base64 W bytes>" }, ... ] }
 
 // 每 tick：变化的网格单元（扁平 [格子下标, 新值, 格子下标, 新值, ...]）
 { type:"patch", c:[ idx0,val0, idx1,val1, ... ] }
+
+// Stage 3：新生成一条归档带（活动网格刚把底部 rows 行压缩归档、整体下移 rows 行）
+{ type:"band", rows, n, cols:"<base64 W bytes>" }
 
 // 玩家名册变化（join / leave）
 { type:"players", players:{ "<id>":{ name, color, ticks }, ... } }
@@ -62,6 +66,7 @@ ws://<host>/r/<roomId>?_pk=<playerId>
 
 - 格子值：`0`=空，`1..4`=玩家槽位（颜色）。`idx = row*W + col`。
 - 增量优先：高频 tick 只发变化单元；`snapshot` 仅在加入时发一次。
+- `band` 是低频事件（只在压缩触发时发一条）。收到时客户端做与服务端**完全相同**的确定性下移（`grid` 整体下移 `rows` 行、顶部腾空），再把这条带追加到归档；因为是确定性的，无需重发整张 `snapshot`，稳态几乎不占带宽。
 
 ---
 
@@ -87,24 +92,44 @@ conns   : Map<ws, playerId>
 
 | 参数 | 值 | 说明 |
 |---|---|---|
-| 网格 `W × H` | 80 × 200 | 服务端持有；客户端显示其中一个窗口（viewRows=170） |
+| 活动网格 `W × H` | 80 × 300 | 服务端持有；客户端显示其中一个窗口（viewRows=250）。底部老沙超阈值时压缩归档（见 Stage 3），而非把 H 无限加大 |
 | 颜色槽位 | amber/teal/violet/rose = 1/2/3/4 | `color 名 → grid 值`，全局一致 |
 | 出口 `SPOUT_X` | {1:30,2:50,3:10,4:70} | 按槽位、沿 `W=80` 均匀分布（中心向外）；出口随堆顶上移（`surface - SPAWN_GAP`） |
-| `SPAWN_GAP` | 92 | 出沙口在堆顶上方这么多行；与客户端 0.618 镜头锚点配套，使水龙头落在视口顶部附近 |
-| 物理帧率 | 20fps（`TICK_MS=50`） | 每 tick：spawn → 重力×2 子步 → diff → 广播 patch（2 子步让下落更顺） |
+| `SPAWN_GAP` | 135 | 出沙口在堆顶上方这么多行；与客户端 0.618 镜头锚点配套，使水龙头落在视口顶部附近 |
+| 物理帧率 | 20fps（`TICK_MS=50`） | 每 tick：spawn → 重力×2 子步 → diff → 广播 patch → 压缩检查（2 子步让下落更顺） |
 | `MAX_SPAWN_PER_TICK` | 4 / 玩家 | 限速，避免狂打字一帧倒满 |
 | 房间容量 | 4 人 | 第 5 个新玩家 → `room_full` |
 | 存盘间隔 | 5s（`SAVE_MS`） | dirty 才写 |
+| `COMPRESS_ROWS`（Stage 3） | 64 | 一次压缩折叠的底部行数（= 一条 band 概括的真实行数） |
+| `COMPRESS_MARGIN`（Stage 3） | 40 | 触发阈值：当**密实层**（行内 ≥ W/2 格的最高行 `packedTop()`）逼近顶部到这么近时压缩。用密实层而非 `surface()`，正在下落的稀疏沙幕不会误触发 |
 
 物理算法（逐行自底向上，重力 + 随机左右下滑，扫描方向逐帧交替）沿用旧客户端引擎，现在跑在服务端、对所有人是同一份。
+
+> 测试用：`SAND_H` / `SAND_COMPRESS_ROWS` / `SAND_COMPRESS_MARGIN` / `SAND_MAX_SPAWN` / `SAND_SAVE_MS` / `SAND_DATA_DIR` 这些环境变量可覆盖上表，仅供 `server/smoke-bands.mjs` 起一个小而快的房间；**生产必须用默认值**（`W/H` 是与客户端的共享契约）。
+
+---
+
+## Stage 3：压缩归档（无限堆积）
+
+让瓶子能无限往上堆而不把 `H` 无限加大：**活动网格固定大小**（跑物理 + 全分辨率渲染），深层老沙压缩成薄层**归档带 `band`** 堆在活动网格下方。
+
+- **触发**：每 tick 在广播 patch 之后检查 `packedTop() <= COMPRESS_MARGIN`（密实层逼近顶部）→ 压缩。
+- **压缩**：取底部 `COMPRESS_ROWS` 行，每列折算成**主色**（该列在这些行里出现最多的非零槽位）；整体 `n` = 这些行的沙粒总数。底部为空则跳过（不归档空带）。
+- **下移**：`grid` 整体下移 `COMPRESS_ROWS` 行（`copyWithin`），顶部腾空继续接新沙；`prev` 同步为下移后网格（不发冗余大 patch），广播一条 `band`。
+- **band 结构**（内存 `{ rows, n, cols:Uint8Array(W) }`；线/盘 `cols` 转 base64）：`rows`=概括了多少行，`n`=沙粒数（用于"已埋"计数），`cols`=每列主色（W 字节，槽位 0..4）。
+- **顺序**：`bands` 数组 index 0 = 最老/最深，末尾 = 最新（紧贴活动网格底部）。
+- **隐私红线照旧**：band 只存每列颜色槽位 + 计数，**绝无键位内容/文本**。
+
+> 二期（暂未实现）：向下滚动到某条 band 时**展开**还原细节；压缩条叠太高时再加二级压缩。
 
 ---
 
 ## 持久化
 
-- 每房间一个文件 `server/data/<roomId>.json`：`{ players, grid:<base64> }`（gitignored）。
+- 每房间一个文件 `server/data/<roomId>.json`：`{ players, grid:<base64>, bands:[{rows,n,cols}] }`（gitignored）。
 - 写：dirty 时每 5s 一次 + 房间空闲停机前。读：房间首次激活时。
-- 服务端就是存档的唯一真相；新玩家加入直接收 `snapshot`，不重放。
+- 向后兼容：老存档没有 `bands` 字段 → 视为 `[]`。
+- 服务端就是存档的唯一真相；新玩家加入直接收 `snapshot`（含 `bands`），不重放。
 
 ---
 
@@ -128,5 +153,5 @@ conns   : Map<ws, playerId>
 
 - **带宽优化**：`patch` 现为全 grid diff；高频多人时可进一步压（RLE / 只发活跃前沿）。
 - **防作弊**：`input` 信任客户端自报计数（原型）；后期可服务端校验速率。
-- **无限累积**：`grid` 满（H 行）即停止增长；底部压缩 / 滚动（沉降展示）留 Stage 3。
+- **无限累积**：✅ 已实现（Stage 3 压缩归档，见上）。剩余：`bands` 无上限增长，超深历史可加二级压缩；展开某条 band 的交互（二期）。
 - **多房间扩展**：单进程多房间；规模大需多进程 / 多机 + 房间路由。

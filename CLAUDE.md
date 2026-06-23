@@ -61,6 +61,7 @@ doc/
   frontend.md       # 前端设计：CSS 变量、组件、动效、canvas 规格
   architecture.md   # 系统架构：分层、数据流、技术选型
   backend.md        # 后端规范：协议、状态结构、部署
+  stage3-compression.md # Stage 3：压缩归档（bands 无限堆积）实现 brief + 已定稿现状
   hardware.md       # 硬件接口（预留）
 package.json        # Tauri CLI + 后端服务脚本
 src-tauri/          # Tauri 外壳（本地构建）

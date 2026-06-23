@@ -361,6 +361,11 @@
 
   // --- authoritative grid (mirror of the server's), updated by snapshot/patch ---
   const grid = new Uint8Array(W * H);
+  // Stage 3 archive: thin strips below the active grid, each folding many rows into
+  // one. index 0 = oldest/deepest; last = newest (sits just under the grid). Each is
+  // rendered as ONE extra world row, so the camera reaches them by scrolling down.
+  let bands = [];                      // [{ rows, n, cols:Uint8Array(W) }]
+  function worldH() { return H + bands.length; } // active grid rows + one row per band
   let cameraY = H - viewRows; // world row at the top of the viewport (float)
   let follow = true;
   let drag = null;
@@ -401,7 +406,7 @@
   // ---------------------------------------------------------------------------
   // Camera helpers — read the surface from the (server-owned) grid.
   // ---------------------------------------------------------------------------
-  function maxCameraY() { return Math.max(0, H - viewRows); }
+  function maxCameraY() { return Math.max(0, worldH() - viewRows); } // can scroll down into the archive
   // The settled pile top: the first row (scanning top→down) holding enough sand to
   // be a real surface — NOT the handful of grains still streaming down from the
   // spouts. Anchoring on the bare highest-occupied cell made the camera and the
@@ -428,19 +433,30 @@
   // Render — blit the visible window of the authoritative grid.
   // ---------------------------------------------------------------------------
   function buildView() {
-    const start = Math.floor(cameraY), rows = viewRows + 2;
+    const start = Math.floor(cameraY), rows = viewRows + 2, nb = bands.length;
     vbuf.fill(0); colRun.fill(0);
     for (let sr = 0; sr < rows; sr++) {
       const wy = start + sr;
-      if (wy < 0 || wy >= H) continue;
-      const base = wy * W, o = sr * W, by = (wy & 3) << 2;
-      for (let x = 0; x < W; x++) {
-        const c = grid[base + x];
-        if (!c) { colRun[x] = 0; continue; }
-        const d = ++colRun[x];
-        const sv = d <= 8 ? 0 : (d <= 13 ? 0.33 : (d <= 18 ? 0.66 : 1));
-        const th = BAYER4[by | (x & 3)] * 0.0625;
-        vbuf[o + x] = palShade[c] ? palShade[c][sv > th ? 1 : 0] : (palU32[c] || 0);
+      if (wy < 0) continue;
+      const o = sr * W;
+      if (wy < H) {
+        // active grid row — full-res with vertical depth shading
+        const base = wy * W, by = (wy & 3) << 2;
+        for (let x = 0; x < W; x++) {
+          const c = grid[base + x];
+          if (!c) { colRun[x] = 0; continue; }
+          const d = ++colRun[x];
+          const sv = d <= 8 ? 0 : (d <= 13 ? 0.33 : (d <= 18 ? 0.66 : 1));
+          const th = BAYER4[by | (x & 3)] * 0.0625;
+          vbuf[o + x] = palShade[c] ? palShade[c][sv > th ? 1 : 0] : (palU32[c] || 0);
+        }
+      } else if (wy < H + nb) {
+        // archived band row — one thin strip of dominant colours per column
+        const cols = bands[nb - 1 - (wy - H)].cols;
+        for (let x = 0; x < W; x++) {
+          const c = cols[x]; colRun[x] = 0;
+          vbuf[o + x] = c ? (palShade[c] ? palShade[c][1] : (palU32[c] || 0)) : 0;
+        }
       }
     }
     vctx.putImageData(vimg, 0, 0);
@@ -508,8 +524,8 @@
       for (const id in players) if (players[id].online !== false) drawSource(players[id], bulbCy);
     }
 
-    // scroll thumb
-    const visFrac = Math.min(1, viewRows / H);
+    // scroll thumb (denominator spans the active grid + the archive below)
+    const visFrac = Math.min(1, viewRows / worldH());
     const hPct = Math.max(8, visFrac * 100);
     const denom = maxCameraY();
     const pos = denom > 0 ? cameraY / denom : 0;
@@ -538,6 +554,7 @@
     u.rowEl = row; u.countEl = cnt; u.barEl = fill; u.swatchEl = sw; u.nameEl = nm; u.roleEl = role;
   }
   function gridGrains() { let n = 0; for (let i = 0; i < grid.length; i++) if (grid[i]) n++; return n; }
+  function buriedCount() { let n = gridGrains(); for (let i = 0; i < bands.length; i++) n += bands[i].n; return n; } // active + archived
   function updateChrome() {
     barCount.textContent = myCount.toLocaleString();
     surfaceBtn.hidden = follow;
@@ -553,7 +570,7 @@
       u.countEl.textContent = u.count.toLocaleString();
       u.barEl.style.width = Math.max(3, Math.round((u.count / max) * 100)) + "%";
     }
-    buriedText.textContent = gridGrains().toLocaleString();
+    buriedText.textContent = buriedCount().toLocaleString();
   }
 
   // ---------------------------------------------------------------------------
@@ -715,10 +732,11 @@
   const wsProto = location.protocol === "https:" ? "wss" : "ws";
 
   function b64ToU8(b64) {
-    const s = atob(b64), u = new Uint8Array(s.length);
+    const s = atob(b64 || ""), u = new Uint8Array(s.length);
     for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i);
     return u;
   }
+  function b64ToColsU8(b64) { const u = b64ToU8(b64), c = new Uint8Array(W); c.set(u.subarray(0, W)); return c; }
   function removePlayer(id) {
     const u = players[id];
     if (!u) return;
@@ -749,6 +767,9 @@
   function applySnapshot(msg) {
     grid.fill(0);
     if (msg.grid) { const u8 = b64ToU8(msg.grid); grid.set(u8.subarray(0, W * H)); }
+    bands = Array.isArray(msg.bands)
+      ? msg.bands.map(function (b) { return { rows: b.rows | 0, n: b.n | 0, cols: b64ToColsU8(b.cols) }; })
+      : [];
     if (msg.players) applyPlayers(msg.players);
     smSurface = surface();                 // land on the real surface, no swoop on join
     if (follow) cameraY = followTarget();
@@ -756,6 +777,20 @@
   function applyPatch(cells) {
     if (!cells) return;
     for (let i = 0; i + 1 < cells.length; i += 2) { const idx = cells[i]; if (idx >= 0 && idx < grid.length) grid[idx] = cells[i + 1]; }
+  }
+  // Stage 3: a new archived layer. Mirror the server's deterministic shift — fold
+  // the bottom away by sliding the whole grid down K rows — then keep the view
+  // steady: the active surface (and a followed camera) moved down K; an archive
+  // viewer's strips each moved down 1 (the new band inserts just under the grid).
+  function applyBand(msg) {
+    const K = msg.rows | 0;
+    if (K <= 0 || K >= H) return;
+    grid.copyWithin(K * W, 0, (H - K) * W);
+    grid.fill(0, 0, K * W);
+    bands.push({ rows: K, n: msg.n | 0, cols: b64ToColsU8(msg.cols) });
+    smSurface += K;
+    cameraY += follow ? K : 1;
+    cameraY = Math.min(maxCameraY(), Math.max(0, cameraY));
   }
 
   let ws = null, reconnectTimer = null, roomFull = false;
@@ -775,6 +810,7 @@
     if (!data) return;
     if (data.type === "snapshot") applySnapshot(data);
     else if (data.type === "patch") applyPatch(data.c);
+    else if (data.type === "band") applyBand(data);
     else if (data.type === "players") applyPlayers(data.players || {});
     else if (data.type === "error") { if (data.reason === "room_full") showRoomFull(); }
   }
@@ -817,7 +853,7 @@
   // ---------------------------------------------------------------------------
   function updateRoomLabel() { if (roomCodeEl) roomCodeEl.textContent = roomId; }
   function clearRoomLocal() {
-    grid.fill(0);
+    grid.fill(0); bands = [];
     for (const id in players) removePlayer(id);
     cameraY = H - viewRows; follow = true; smSurface = H;
   }
