@@ -19,6 +19,15 @@ fi
 # Restart only for backend/contract changes; frontend (index.html, docs) is served
 # with no-cache, so a pull is enough and we avoid dropping live WebSocket sessions.
 if git diff --name-only "$before" "$after" | grep -qE '^server/|^package(-lock)?\.json$'; then
+  # Snapshot saved room/player data BEFORE the restart — the save format can convert
+  # on boot (player/world decoupling), so keep recoverable backups outside the git tree.
+  if [ -d server/data ]; then
+    mkdir -p /opt/titb-backups
+    archive="/opt/titb-backups/data-$(date +%Y%m%d-%H%M%S)-${after:0:7}.tgz"
+    tar czf "$archive" -C server data && echo "backed up server/data → $archive"
+    # keep only the 20 most recent snapshots
+    ls -1t /opt/titb-backups/data-*.tgz 2>/dev/null | tail -n +21 | xargs -r rm -f
+  fi
   echo "backend changed → restarting titb"
   systemctl restart titb
   echo "deployed $after (restarted)"
