@@ -522,22 +522,30 @@
   let drag = null;
   let frame = 0;
 
-  // shading (kept identical to the old look)
-  let palU32 = [], palShade = [];
-  const SHADE_F = [1.25, 1.0];
+  // BAYER4 — ordered-dither matrix, still used by the source bulb (drawSource) below.
   const BAYER4 = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
-  const colRun = new Int16Array(W);
 
   function packRGB(r, g, b) { return ((255 << 24) | (b << 16) | (g << 8) | r) >>> 0; }
-  function shadeU32(rgb, f) {
-    return packRGB(Math.min(255, Math.round(rgb[0] * f)), Math.min(255, Math.round(rgb[1] * f)), Math.min(255, Math.round(rgb[2] * f)));
-  }
-  function buildPalette() {
-    palU32 = [0]; palShade = [null];
-    for (const u of USER_COLORS) {
-      palU32.push(packRGB(u.rgb[0], u.rgb[1], u.rgb[2]));
-      palShade.push(SHADE_F.map(function (f) { return shadeU32(u.rgb, f); }));
-    }
+
+  // Per-grain colour jitter (the Sandboxels "grainy sand" look). Each grid cell renders
+  // as a flat 2×2 block; we just nudge its single colour grain-to-grain so a field of one
+  // player's sand reads as granular noise instead of a flat slab. The offset is a PURE
+  // hash of world position (x, wy) + slot — so it's identical on every client (server-
+  // authoritative safe), needs ZERO per-grain state on the wire, and is locked to the
+  // sand (scrolls with the tower). Settled sand looks grainy; only the live falling
+  // curtain "flows through" the static field, which is fine since sand settles fast.
+  // (Replaces the old depth-shade + Bayer dither; same offset on R/G/B = brightness-only
+  // jitter, hue stays put.)
+  const JITTER = 15;          // ± brightness offset on the 0..255 scale (≈ Sandboxels; tune freely)
+  // 32-bit integer hash (murmur3 fmix finalizer). Math.imul keeps every multiply inside
+  // 32 bits: a plain `a * b` here overflows 2^53 and silently zeroes the low bits, which
+  // collapsed every cell to the same hash → all sand one flat tone. Do NOT swap in `*`.
+  function cellJitter(x, y, slot) {
+    let n = Math.imul(x, 374761393) ^ Math.imul(y, 668265263) ^ Math.imul(slot, 2246822519);
+    n ^= n >>> 16; n = Math.imul(n, 0x85ebca6b);
+    n ^= n >>> 13; n = Math.imul(n, 0xc2b2ae35);
+    n ^= n >>> 16;
+    return ((n >>> 0) % (2 * JITTER + 1)) - JITTER;   // deterministic integer in [-JITTER, +JITTER]
   }
 
   // offscreen compositing buffer (a touch taller for sub-pixel scroll)
@@ -585,7 +593,7 @@
   // ---------------------------------------------------------------------------
   function buildView() {
     const start = Math.floor(cameraY), rows = viewRows + 2, wTotal = H + archiveRows;
-    vbuf.fill(0); colRun.fill(0);
+    vbuf.fill(0);
     let seg = null, segEnd = 0, src = grid, srcBase = 0; // src+base pick the row's pixels (grid or a band)
     for (let sr = 0; sr < rows; sr++) {
       const wy = start + sr;
@@ -595,16 +603,21 @@
         if (!seg || wy >= segEnd) { seg = segFor(wy); segEnd = seg.top + seg.rows; src = bands[seg.bi].cells; }
         srcBase = (wy - seg.top) * W;
       }
-      // identical shading for active + archive (the archive IS the same sand, contiguous
-      // from the active bottom) → the depth run carries across the seam, seamless history.
-      const o = sr * W, by = (wy & 3) << 2;
+      // flat colour per grain + per-position jitter — active grid and archive share one
+      // noise field keyed on world row wy, so history reads seamlessly and every client
+      // paints the identical texture.
+      const o = sr * W;
       for (let x = 0; x < W; x++) {
         const c = src[srcBase + x];
-        if (!c) { colRun[x] = 0; continue; }
-        const d = ++colRun[x];
-        const sv = d <= 8 ? 0 : (d <= 13 ? 0.33 : (d <= 18 ? 0.66 : 1));
-        const th = BAYER4[by | (x & 3)] * 0.0625;
-        vbuf[o + x] = palShade[c] ? palShade[c][sv > th ? 1 : 0] : (palU32[c] || 0);
+        if (!c) continue;
+        const base = USER_COLORS[c - 1];
+        if (!base) continue;
+        const rgb = base.rgb, j = cellJitter(x, wy, c);
+        let r = rgb[0] + j, g = rgb[1] + j, b = rgb[2] + j;
+        if (r < 0) r = 0; else if (r > 255) r = 255;
+        if (g < 0) g = 0; else if (g > 255) g = 255;
+        if (b < 0) b = 0; else if (b > 255) b = 255;
+        vbuf[o + x] = packRGB(r, g, b);
       }
     }
     vctx.putImageData(vimg, 0, 0);
@@ -1171,7 +1184,6 @@
   }
 
   // --- init ---
-  buildPalette();
   updateRoomLabel();
   updateChrome();
   requestAnimationFrame(tick);
