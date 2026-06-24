@@ -654,16 +654,20 @@
   canvas.addEventListener("pointerdown", function (e) {
     e.preventDefault();
     e.stopPropagation();
-    drag = { y: e.clientY, cam: cameraY };
+    drag = { y: e.clientY };
     follow = false;
     canvas.classList.add("grabbing");
   });
   window.addEventListener("pointermove", function (e) {
     if (!drag) return;
-    // Drag UP to dig down into older sand (grab-the-content feel): moving the
-    // pointer up raises cameraY toward the bottom of the well.
+    // Drag UP to dig down into older sand (grab-the-content feel): moving the pointer up
+    // raises cameraY toward the bottom of the well. Apply the move as an INCREMENTAL delta
+    // (re-anchor each move) + clamp every step, so over-dragging at the very bottom/top
+    // doesn't build an invisible "dead zone" you have to un-drag before it responds — the
+    // ends feel like a hard stop.
     const dy = (e.clientY - drag.y) / S;
-    cameraY = Math.min(maxCameraY(), Math.max(camLo(), drag.cam - dy));
+    drag.y = e.clientY;
+    cameraY = Math.min(maxCameraY(), Math.max(camLo(), cameraY - dy));
   });
   window.addEventListener("pointerup", function () {
     if (!drag) return;
@@ -1012,7 +1016,7 @@
     }
     function lit(b, on) { b.style.background = on ? ON : OFF; b.style.color = on ? "#0a0a0a" : "#7fffd4"; }
     const tag = document.createElement("span"); tag.textContent = "spout"; tag.style.color = "#7fffd4"; bar.appendChild(tag);
-    let size = 2; const sizeBtns = [];
+    let size = 1; const sizeBtns = [];
     for (let n = 1; n <= 5; n++) {
       const b = mk(String(n), "brush " + n + "×" + n);
       b.addEventListener("click", function (e) { e.stopPropagation(); size = n; send({ type: "spout", size: n }); sizeBtns.forEach(function (x, i) { lit(x, i + 1 === size); }); });

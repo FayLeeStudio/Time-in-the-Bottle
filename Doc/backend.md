@@ -105,7 +105,7 @@ conns   : Map<ws, playerId>
 | 出口 `SPOUT_X` | {1:30,2:50,3:10,4:70} | 按槽位、沿 `W=80` 均匀分布（中心向外）；出口随堆顶上移（`surface - SPAWN_GAP`） |
 | `SPAWN_GAP` | 135 | 出沙口在堆顶上方这么多行；与客户端 0.618 镜头锚点配套，使水龙头落在视口顶部附近 |
 | 物理帧率 | 20fps（`TICK_MS=50`） | 每 tick：spawn → flood → 重力×2 子步 → diff → 广播 patch → 压缩检查（2 子步让下落更顺） |
-| 出水口画笔 `DEFAULT_SPOUT` | 2（上限 `SPOUT_MAX=5`） | 出沙是以出口为锚点的 **N×N 方形画笔**：每 tick 在 footprint 内从队列补满 |
+| 出水口画笔 `DEFAULT_SPOUT` | 1（上限 `SPOUT_MAX=5`） | 出沙是以出口为锚点的 **N×N 方形画笔**：每 tick 在 footprint 内从队列补满。1=一颗一颗，≥2=连续 |
 | 房间容量 | 4 人 | 第 5 个新玩家 → `room_full` |
 | 存盘间隔 | 5s（`SAVE_MS`） | dirty 才写 |
 | `COMPRESS_ROWS`（Stage 3） | 64 | 一次折叠的底部行数（= 一条 band 的真实行数） |

@@ -65,7 +65,7 @@ const SAVE_MS = numEnv("SAND_SAVE_MS", 5000);
 // drops 2 rows/tick, consecutive stamps connect for N≥2 (a continuous N-wide stream);
 // N=1 leaves a 1-row gap (the old one-at-a-time dashed look). Width is capped at SPOUT_MAX.
 const SPOUT_MAX = 5;
-const DEFAULT_SPOUT = numEnv("SAND_SPOUT", 2); // brush size out of the box (2 = continuous + thin)
+const DEFAULT_SPOUT = numEnv("SAND_SPOUT", 1); // brush size out of the box (1 = one-at-a-time; 2+ = continuous)
 const FLOOD_ROWS_PER_TICK = 6; // debug {type:"flood"}: directly fill this many bottom rows/tick (fast archive test)
 
 // --- Stage 3: archive compression (infinite stacking; see doc/stage3-compression.md) ---
