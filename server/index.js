@@ -7,6 +7,11 @@
 // thing. Privacy red line is intact: we only ever handle counts + grid pixels —
 // never key contents, never text.
 //
+// Saves are DECOUPLED (ARK-style): a WORLD save per room (grid + bands + member roster)
+// and a global PLAYER profile per playerId (name + skills + lifetime + worlds joined).
+// The wire protocol below is UNCHANGED — the server synthesizes the old { id:{name,color,
+// ticks} } roster from members + profiles (rosterForWire), so the client needs no edits.
+//
 // Wire protocol (see also doc/backend.md):
 //   client → server:
 //     { type:"join",  name, color:"auto" }   // color assigned by server
@@ -47,7 +52,14 @@ const numEnv = (k, d) => { const v = parseInt(process.env[k], 10); return Number
 
 const PORT = process.env.PORT || 8090;
 const DATA_DIR = process.env.SAND_DATA_DIR || path.join(__dirname, "data");
-fs.mkdirSync(DATA_DIR, { recursive: true });
+// Saves are split in two (decoupled, ARK-style): a WORLD save per room (grid + bands +
+// member roster) and a global PLAYER profile per playerId (name + skills + lifetime +
+// which worlds they've joined). The world no longer stores player names — those live on
+// the profile, so one player has a single global identity across every world.
+const WORLDS_DIR = path.join(DATA_DIR, "worlds");
+const PLAYERS_DIR = path.join(DATA_DIR, "players");
+fs.mkdirSync(WORLDS_DIR, { recursive: true });
+fs.mkdirSync(PLAYERS_DIR, { recursive: true });
 
 // --- sim constants (shared contract with the client renderer; frontend.md) ---
 const W = 80;             // grid columns
@@ -82,13 +94,65 @@ const colorSlot = (c) => Math.max(1, ROOM_COLORS.indexOf(c) + 1);
 const b64enc = (u8) => Buffer.from(u8).toString("base64");
 function b64dec(s, len) { const buf = Buffer.from(String(s || ""), "base64"); const a = new Uint8Array(len); a.set(buf.subarray(0, len)); return a; }
 
+// --- global player profiles (decoupled from worlds) -------------------------
+// One file per playerId: data/players/<id>.json. A profile is the player's GLOBAL
+// identity — name + skills/talents (reserved for the gamification phase) + lifetime
+// accumulation + the list of worlds they've joined. It is process-global (shared by
+// every Room), cached in memory, and flushed on a timer. Privacy red line holds:
+// counts + name only, never key contents.
+const freshProfile = (id) => ({ id, name: "Player", createdAt: Date.now(), lastSeen: 0, skills: {}, lifetime: { ticks: 0 }, worlds: [] });
+class PlayerStore {
+  constructor() { this.cache = new Map(); this.dirty = new Set(); setInterval(() => this.flush(), SAVE_MS); }
+  file(id) { return path.join(PLAYERS_DIR, String(id).replace(/[^A-Za-z0-9_-]/g, "_") + ".json"); }
+  // Normalize a parsed/blank profile so partial or back-compat files always have every field.
+  norm(id, p) {
+    if (!p || typeof p !== "object") p = freshProfile(id);
+    p.id = id;
+    if (typeof p.name !== "string") p.name = "Player";
+    if (!p.skills || typeof p.skills !== "object") p.skills = {};
+    if (!p.lifetime || typeof p.lifetime !== "object") p.lifetime = { ticks: 0 };
+    if (typeof p.lifetime.ticks !== "number") p.lifetime.ticks = 0;
+    if (!Array.isArray(p.worlds)) p.worlds = [];
+    if (!p.createdAt) p.createdAt = Date.now();
+    if (!p.lastSeen) p.lastSeen = 0;
+    return p;
+  }
+  // get: load-or-create + cache (used on the live path). peek: read-only, never creates.
+  get(id) {
+    let p = this.cache.get(id);
+    if (p) return p;
+    try { p = this.norm(id, JSON.parse(fs.readFileSync(this.file(id), "utf8"))); }
+    catch (_) { p = freshProfile(id); }
+    this.cache.set(id, p);
+    return p;
+  }
+  peek(id) {
+    if (this.cache.has(id)) return this.cache.get(id);
+    try { return this.norm(id, JSON.parse(fs.readFileSync(this.file(id), "utf8"))); } catch (_) { return null; }
+  }
+  touch(id, name) { const p = this.get(id); if (name) p.name = String(name); p.lastSeen = Date.now(); this.dirty.add(id); return p; }
+  addWorld(id, roomId) { const p = this.get(id); if (!p.worlds.includes(roomId)) { p.worlds.push(roomId); this.dirty.add(id); } }
+  // lifetime is the device-level monotonic counter's high-water mark — NOT a sum of
+  // per-room deltas (joining a fresh room would replay the whole device history as one
+  // delta and over-count). max() is monotonic + correct for one device; refine to
+  // "max per device, summed" when accounts/multi-device land.
+  bumpLifetime(id, reported) { const p = this.get(id); reported = Number(reported) || 0; if (reported > p.lifetime.ticks) p.lifetime.ticks = reported; p.lastSeen = Date.now(); this.dirty.add(id); }
+  flush() {
+    if (!this.dirty.size) return;
+    const ids = [...this.dirty]; this.dirty.clear();
+    for (const id of ids) { const p = this.cache.get(id); if (p) fs.writeFile(this.file(id), JSON.stringify(p), () => {}); }
+  }
+}
+const playerStore = new PlayerStore();
+
 class Room {
   constructor(id) {
     this.id = id;
     this.grid = new Uint8Array(W * H);
     this.prev = new Uint8Array(W * H); // last-broadcast grid, for diffing patches
     this.bands = [];                   // Stage 3 archive: [{ rows, n, cells:Uint8Array(rows*W) }], index 0 = oldest/deepest
-    this.players = {};                 // playerId -> { name, color, ticks }
+    this.createdAt = Date.now();       // world birth (load() overrides for existing worlds)
+    this.members = {};                 // playerId -> { color, ticks, contributionTicks, joinedAt } (name lives on the global profile)
     this.queues = {};                  // playerId -> grains pending spawn
     this.spoutSize = {};               // playerId -> N (pour brush size 1..SPOUT_MAX)
     this.flooding = {};                // playerId -> bool (debug fast bottom-fill)
@@ -109,49 +173,67 @@ class Room {
   }
   maybeStop() {
     if (this.conns.size > 0) return;
-    this.save();
+    this.save(); playerStore.flush();
     clearInterval(this.timer); clearInterval(this.saveTimer);
     this.timer = this.saveTimer = null; // idle room: stop burning CPU, keep grid in RAM + on disk
   }
 
   takeColor() {
-    const used = new Set(Object.values(this.players).map((p) => p.color));
+    const used = new Set(Object.values(this.members).map((m) => m.color));
     for (const c of ROOM_COLORS) if (!used.has(c)) return c;
     return ROOM_COLORS[0];
   }
 
   // ---- persistence (the server is the single source of truth) ----
-  file() { return path.join(DATA_DIR, this.id.replace(/[^A-Za-z0-9_-]/g, "_") + ".json"); }
+  safeId() { return this.id.replace(/[^A-Za-z0-9_-]/g, "_"); }
+  file() { return path.join(WORLDS_DIR, this.safeId() + ".json"); }
   // Bands for the wire/disk: cells → base64. Old saves have no `bands` → [] (back-compat).
   serializeBands() { return this.bands.map((b) => ({ rows: b.rows, n: b.n, cells: b64enc(b.cells) })); }
   load() {
-    try {
-      const d = JSON.parse(fs.readFileSync(this.file(), "utf8"));
-      if (d.players) this.players = d.players;
-      if (d.grid) { const buf = Buffer.from(d.grid, "base64"); this.grid.set(buf.subarray(0, W * H)); }
-      if (Array.isArray(d.bands)) this.bands = d.bands.map((b) => { const rows = b.rows | 0; return { rows, n: b.n | 0, cells: b64dec(b.cells, rows * W) }; });
-      this.prev.set(this.grid);
-    } catch (_) { /* fresh room */ }
+    // Preferred: the new world file under worlds/. Fallback: a legacy top-level
+    // data/<id>.json in the old { players:{pid:{name,color,ticks}} } shape — convert it
+    // in place (a safety net; the normal upgrade path is server/migrate.mjs).
+    let d = null;
+    try { d = JSON.parse(fs.readFileSync(this.file(), "utf8")); } catch (_) {}
+    if (!d) { try { d = JSON.parse(fs.readFileSync(path.join(DATA_DIR, this.safeId() + ".json"), "utf8")); } catch (_) {} }
+    if (!d) return; // fresh room
+    if (d.createdAt) this.createdAt = d.createdAt;
+    if (d.grid) { const buf = Buffer.from(d.grid, "base64"); this.grid.set(buf.subarray(0, W * H)); }
+    if (Array.isArray(d.bands)) this.bands = d.bands.map((b) => { const rows = b.rows | 0; return { rows, n: b.n | 0, cells: b64dec(b.cells, rows * W) }; });
+    if (d.members && typeof d.members === "object") {
+      for (const id in d.members) { const m = d.members[id] || {}; this.members[id] = { color: m.color || ROOM_COLORS[0], ticks: m.ticks | 0, contributionTicks: m.contributionTicks | 0, joinedAt: m.joinedAt || 0 }; }
+    } else if (d.players && typeof d.players === "object") {
+      // legacy shape: lift each player's name into the global profile, keep color/ticks as a member.
+      for (const id in d.players) {
+        const p = d.players[id] || {};
+        this.members[id] = { color: p.color || ROOM_COLORS[0], ticks: p.ticks | 0, contributionTicks: 0, joinedAt: 0 };
+        playerStore.touch(id, p.name); playerStore.addWorld(id, this.id); playerStore.bumpLifetime(id, p.ticks | 0);
+      }
+      this.dirty = true; // re-persist under the new worlds/ path + shape on the next save
+    }
+    this.prev.set(this.grid);
   }
   save() {
     if (!this.dirty) return;
     this.dirty = false;
-    const data = { players: this.players, grid: Buffer.from(this.grid).toString("base64"), bands: this.serializeBands() };
+    const data = { id: this.id, createdAt: this.createdAt, members: this.members, grid: Buffer.from(this.grid).toString("base64"), bands: this.serializeBands() };
     fs.writeFile(this.file(), JSON.stringify(data), () => {});
   }
 
   // ---- connection lifecycle ----
   join(ws, playerId, name) {
-    if (!this.players[playerId]) {
-      if (Object.keys(this.players).length >= ROOM_CAP) {
-        try { ws.send(JSON.stringify({ type: "error", reason: "room_full" })); ws.close(); } catch (_) {}
-        return false;
-      }
-      this.players[playerId] = { name: String(name || "Player"), color: this.takeColor(), ticks: 0 };
-      this.dirty = true;
-    } else if (name) {
-      this.players[playerId].name = String(name);
+    // Reject a full room BEFORE creating any profile/member (don't leave a profile behind
+    // for someone who couldn't get in).
+    if (!this.members[playerId] && Object.keys(this.members).length >= ROOM_CAP) {
+      try { ws.send(JSON.stringify({ type: "error", reason: "room_full" })); ws.close(); } catch (_) {}
+      return false;
     }
+    playerStore.touch(playerId, name);     // global profile: identity/name/lastSeen
+    if (!this.members[playerId]) {
+      this.members[playerId] = { color: this.takeColor(), ticks: 0, contributionTicks: 0, joinedAt: Date.now() };
+      this.dirty = true;
+    }
+    playerStore.addWorld(playerId, this.id); // bidirectional membership: profile ↔ world
     this.conns.set(ws, playerId);
     this.ensureRunning();
     this.snapshotTo(ws);     // full state to the newcomer
@@ -159,20 +241,22 @@ class Room {
     return true;
   }
   onInput(playerId, ticks) {
-    const p = this.players[playerId];
-    if (!p) return;
+    const m = this.members[playerId];
+    if (!m) return;
     ticks = Number(ticks) || 0;
-    const delta = ticks - p.ticks;
+    const delta = ticks - m.ticks;
     if (delta > 0) this.queues[playerId] = Math.min((this.queues[playerId] || 0) + delta, 600);
-    p.ticks = ticks;
+    m.ticks = ticks;
+    playerStore.bumpLifetime(playerId, ticks); // global lifetime = high-water mark of the device counter
   }
-  setSpout(playerId, size) { if (this.players[playerId]) this.spoutSize[playerId] = Math.max(1, Math.min(SPOUT_MAX, size | 0)); }
-  setFirehose(playerId, on) { if (this.players[playerId]) this.flooding[playerId] = !!on; } // debug fast bottom-fill
-  setPour(playerId, on) { if (this.players[playerId]) this.pouring[playerId] = !!on; }       // debug keep spout saturated
+  setSpout(playerId, size) { if (this.members[playerId]) this.spoutSize[playerId] = Math.max(1, Math.min(SPOUT_MAX, size | 0)); }
+  setFirehose(playerId, on) { if (this.members[playerId]) this.flooding[playerId] = !!on; } // debug fast bottom-fill
+  setPour(playerId, on) { if (this.members[playerId]) this.pouring[playerId] = !!on; }       // debug keep spout saturated
   leave(playerId) {
-    if (!this.players[playerId]) return;
-    delete this.players[playerId]; delete this.queues[playerId];
+    if (!this.members[playerId]) return;
+    delete this.members[playerId]; delete this.queues[playerId];
     delete this.spoutSize[playerId]; delete this.flooding[playerId]; delete this.pouring[playerId];
+    // NOTE: we keep roomId in the profile's `worlds` — "has joined" is a history record.
     this.dirty = true; this.broadcastPlayers();
   }
   drop(ws) { // keep player (offline ≠ exit), but stop debug pours so they can't run forever
@@ -223,8 +307,8 @@ class Room {
   }
   spawn() {
     const sr = Math.max(SPAWN_ROW, this.surface() - SPAWN_GAP); // source rides just above the peak
-    for (const id in this.players) {
-      const slot = colorSlot(this.players[id].color);
+    for (const id in this.members) {
+      const slot = colorSlot(this.members[id].color);
       const x0 = SPOUT_X[slot] || 40;
       const N = this.spoutSize[id] || DEFAULT_SPOUT;
       if (this.pouring[id]) { this.brush(slot, x0, sr, N, N * N); continue; } // debug: tap full open
@@ -237,8 +321,8 @@ class Room {
   // pour/physics), so testing the archive doesn't require minutes of typing.
   floodFill() {
     for (const id in this.flooding) {
-      if (!this.flooding[id] || !this.players[id]) continue;
-      const slot = colorSlot(this.players[id].color);
+      if (!this.flooding[id] || !this.members[id]) continue;
+      const slot = colorSlot(this.members[id].color);
       let budget = FLOOD_ROWS_PER_TICK * W;
       for (let y = H - 1; y >= 0 && budget > 0; y--) {
         const b = y * W;
@@ -298,17 +382,28 @@ class Room {
     // (not the falling curtain) so we only fold a genuinely full bottom.
     if (H > COMPRESS_ROWS && this.packedTop() <= COMPRESS_MARGIN) this.archiveBottom();
   }
+  // Synthesize the wire roster from world members (color/ticks) + global profiles (name),
+  // back into the old { id:{name,color,ticks} } shape — so the wire protocol is UNCHANGED
+  // and the client needs no edits despite the player/world save split.
+  rosterForWire() {
+    const out = {};
+    for (const id in this.members) {
+      const m = this.members[id], prof = playerStore.get(id);
+      out[id] = { name: (prof && prof.name) || "Player", color: m.color, ticks: m.ticks };
+    }
+    return out;
+  }
   snapshotTo(ws) {
     try {
       ws.send(JSON.stringify({
         type: "snapshot", w: W, h: H,
-        players: this.players,
+        players: this.rosterForWire(),
         grid: Buffer.from(this.grid).toString("base64"),
         bands: this.serializeBands(),
       }));
     } catch (_) {}
   }
-  broadcastPlayers() { this.broadcast({ type: "players", players: this.players }); }
+  broadcastPlayers() { this.broadcast({ type: "players", players: this.rosterForWire() }); }
   broadcast(msg) {
     const s = JSON.stringify(msg);
     for (const ws of this.conns.keys()) { try { ws.send(s); } catch (_) {} }
@@ -331,6 +426,16 @@ const server = http.createServer((req, res) => {
       res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-cache" });
       res.end(buf);
     });
+    return;
+  }
+  // Read-only player profile (name / lifetime / which worlds joined). Lets "my worlds"
+  // be queryable later; privacy-safe (counts + name only, no key contents). 404 if unknown.
+  const apiM = p.match(/^\/api\/player\/([^/]+)$/);
+  if (apiM) {
+    const prof = playerStore.peek(decodeURIComponent(apiM[1]));
+    if (!prof) { res.writeHead(404, { "content-type": "application/json; charset=utf-8" }); res.end('{"error":"not_found"}'); return; }
+    res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-cache" });
+    res.end(JSON.stringify({ id: prof.id, name: prof.name, lifetime: prof.lifetime, worlds: prof.worlds, createdAt: prof.createdAt, lastSeen: prof.lastSeen }));
     return;
   }
   res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });

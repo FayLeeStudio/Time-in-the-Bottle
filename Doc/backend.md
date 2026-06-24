@@ -25,9 +25,10 @@
 ws://<host>/r/<roomId>?_pk=<playerId>
 ```
 
-- 每个 `roomId` 对应一个内存中的 `Room`（含 grid + 模拟循环）。
-- `_pk` = 客户端**持久** playerId（存 localStorage 复用），用于认出"老玩家回来了" vs "新玩家"。
+- 每个 `roomId` 对应一个内存中的 `Room`（= **世界**：含 grid + 成员名单 + 模拟循环）。
+- `_pk` = 客户端**持久** playerId（存 localStorage 复用），用于认出"老玩家回来了" vs "新玩家"，并定位其**全局玩家档案**。
 - 默认端口 `8090`（`PORT` 环境变量可改）。生产经 Caddy 反代为 `wss://<domain>`。
+- 只读 HTTP：`GET /api/player/<playerId>` → 该玩家的全局档案（`{ id, name, lifetime, worlds, createdAt, lastSeen }`，未知返回 404）。隐私安全：只含计数 + 名字，**无键位内容**。供"我加入过哪些世界"将来在 UI 列出。
 - 同一 HTTP 服务还**托管前端**：`GET /`（或 `/index.html`）直接返回仓库根的 `index.html`，带 `cache-control: no-cache`（避免 webview/浏览器缓存住旧页面 → 前端改动 `git pull` 即生效、无需重启进程）。Tauri 外壳与浏览器都加载这个 URL，不再用 GitHub Pages。
 
 ---
@@ -73,6 +74,7 @@ ws://<host>/r/<roomId>?_pk=<playerId>
 ```
 
 - 格子值：`0`=空，`1..4`=玩家槽位（颜色）。`idx = row*W + col`。
+- **名册是合成的**：`players:{id:{name,color,ticks}}` 由服务端 `rosterForWire()` 把**世界成员**（color/ticks）与**全局玩家档案**（name）现合并而成。存储已拆成玩家档案/世界档案两套（见下），但**线协议不变**，客户端无需改动。
 - 增量优先：高频 tick 只发变化单元；`snapshot` 仅在加入时发一次。
 - `band` 是低频事件（只在压缩触发时发一条）。收到时客户端做与服务端**完全相同**的确定性下移（`grid` 整体下移 `rows` 行、顶部腾空），再把这条带追加到归档；因为是确定性的，无需重发整张 `snapshot`，稳态几乎不占带宽。
 - 客户端**不做** 1px 细条特殊显示：归档带在世界坐标里按真实高度 `rows` 展开，滚动到附近时**逐像素无损**还原（`cells` = `rows*W` 精确像素，和当时一模一样），压缩对用户透明。相机随之 `cameraY += rows`，视图不动。
@@ -81,19 +83,32 @@ ws://<host>/r/<roomId>?_pk=<playerId>
 
 ## 服务端状态结构（`server/index.js`）
 
-每个 `Room`：
+**存档解耦（ARK 式）**：玩家数据与世界数据分两套存储——`Room`（世界）+ 进程级 `PlayerStore`（全局玩家档案）。
+
+每个 `Room`（= 一个**世界**）：
 
 ```text
-grid    : Uint8Array(W*H)   // 唯一真相
-prev    : Uint8Array(W*H)   // 上一帧广播态，用于 diff 出 patch
-players : { playerId: { name, color, ticks } }   // 持久（断线不删）
-queues  : { playerId: 待出沙粒数 }
-conns   : Map<ws, playerId>
+grid     : Uint8Array(W*H)   // 唯一真相
+prev     : Uint8Array(W*H)   // 上一帧广播态，用于 diff 出 patch
+bands    : [{rows,n,cells}]  // Stage 3 归档
+createdAt: number            // 世界创建时间
+members  : { playerId: { color, ticks, contributionTicks, joinedAt } }  // 成员名单（不存 name）
+queues   : { playerId: 待出沙粒数 }
+conns    : Map<ws, playerId>
 ```
 
-- 进程重启 / 房间首次激活 → 从 `server/data/<roomId>.json` 读回 `players` + `grid`。
-- 断线（close）：只移除连接，**保留玩家**（离线 ≠ 退出）；房间空闲时停模拟循环省 CPU，grid 留在内存 + 磁盘。
-- 显式 `leave` 才删玩家、释放颜色。
+进程级 `playerStore`（一个 `PlayerStore` 实例，所有房间共享）：
+
+```text
+profile  : { id, name, createdAt, lastSeen, skills:{}, lifetime:{ticks}, worlds:[roomId...] }
+```
+
+- **全局角色**：`skills`/`lifetime` 归玩家本人，加入任何世界都生效（本期预留，不参与逻辑）；`worlds` = 双向成员索引（该玩家加入过哪些世界）。
+- `lifetime.ticks` 用 `max(lifetime.ticks, reported)` 维护（reported = 客户端上报的设备级单调计数）——**不是**累加各房间 delta（加入新房间会把整段历史当一个大 delta，累加会重复计数）。多设备/账号时再细化为"各设备 max 求和"。
+- `member.ticks` = 旧 `player.ticks` 的角色（出沙增量来源 + 名册显示）；`contributionTicks` 预留给精确"本世界贡献"统计，本期恒 0。
+- 进程重启 / 房间首次激活 → 从 `data/worlds/<roomId>.json` 读回 `members` + grid + bands；玩家档案按 `_pk` 从 `data/players/<playerId>.json` 懒加载进 `playerStore`。
+- 断线（close）：只移除连接，**保留成员**（离线 ≠ 退出）；房间空闲时停模拟循环省 CPU，grid 留在内存 + 磁盘。
+- 显式 `leave` 才删 member、释放颜色；但**不**从玩家档案的 `worlds` 移除（"曾加入"是历史记录）。
 
 ---
 
@@ -143,12 +158,15 @@ conns   : Map<ws, playerId>
 
 ---
 
-## 持久化
+## 持久化（两套存档，均 gitignored 于 `server/data/`）
 
-- 每房间一个文件 `server/data/<roomId>.json`：`{ players, grid:<base64>, bands:[{rows,n,cells}] }`（gitignored；`cells` = 该 band `rows*W` 字节的精确像素，base64）。
-- 写：dirty 时每 5s 一次 + 房间空闲停机前。读：房间首次激活时。
+- **世界档案** `server/data/worlds/<roomId>.json`：`{ id, createdAt, members, grid:<base64>, bands:[{rows,n,cells}] }`（`cells` = 该 band `rows*W` 字节精确像素，base64）。
+- **玩家档案** `server/data/players/<playerId>.json`：`{ id, name, createdAt, lastSeen, skills, lifetime:{ticks}, worlds }`。
+- 写：世界 dirty 时每 5s 一次 + 房间空闲停机前；玩家档案由 `playerStore` 每 5s 刷脏 + 房间停机时一并 flush。读：房间/档案首次激活时懒加载。
+- **迁移**：旧的耦合存档 `server/data/<roomId>.json`（`{ players:{pid:{name,color,ticks}}, grid, bands }`）由 `server/migrate.mjs`（`npm run migrate`）一次性拆成上面两套，原文件移到 `server/data/legacy/` 备份。脚本**幂等**：同一 pid 跨多房间 → 合并成一份档案（name 取最新房间、worlds 取并集、lifetime 取 max）。
+- **兜底**：若没跑迁移就直接启动，`Room.load()` 会在找不到 `worlds/<id>.json` 时回退读旧顶层 `data/<id>.json`、现场转成 `members` + 把 name 提进玩家档案，下次 save 即落到新路径。
 - 向后兼容：老存档没有 `bands` 字段 → 视为 `[]`。
-- 服务端就是存档的唯一真相；新玩家加入直接收 `snapshot`（含 `bands`），不重放。
+- 服务端就是存档的唯一真相；新玩家加入直接收 `snapshot`（含 `bands`，名册由 `rosterForWire()` 合成），不重放。
 
 ---
 
@@ -165,6 +183,8 @@ conns   : Map<ws, playerId>
 > ⚠️ **部署顺序**：先让 VPS 跑起来、本地用 `?host=<domain>` 验证 `wss` 通，**再**改 `PROD_HOST` 并 push 前端。否则线上 Pages 会指向一个还不存在的后端（空瓶 / 连不上）。
 
 本地开发：`npm run server`（localhost:8090），`index.html` 从 `file://` / localhost 自动连本地。
+
+> **升级到解耦存档（一次性）**：VPS 上先停服务、**备份 `server/data/`**，`npm run migrate` 把旧 `data/<roomId>.json` 拆成 `worlds/` + `players/`（原文件进 `legacy/`），核对无误后 `git pull` 新代码再 `systemctl restart`（后端/契约改动必须重启）。即使忘了跑迁移，服务端启动时也会按房间逐个兜底转换（见上）。线协议未变，旧客户端照常工作。
 
 ---
 
