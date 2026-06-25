@@ -1,21 +1,22 @@
 # Sand Together — 后端规范（服务端权威）
 
-> 2026-06-21 架构转向后的后端：**常驻 Node + ws 服务，跑权威物理**。
+> 后端：**常驻 Node + ws 服务**，每房间权威裁决 + 持久化；同步用**确定性帧同步（lockstep）**——客户端也跑共享 `/sim.js`、自己的沙零延迟预测（已上线）。模型见 `architecture.md`「同步模型」。
 > 旧的 Cloudflare Workers + DO 版本已作废（见 git 历史 / `party/`）。
-> 架构背景见 `architecture.md`、`CLAUDE.md`。
 
 ---
 
 ## 职责
 
-后端是一个**常驻、有状态**的进程。对每个房间：
+后端是一个**常驻、有状态**的进程，是每个房间的**权威**：
 
-1. 跑 falling-sand 物理模拟（权威），持有该房间唯一的 `grid`（= 房间真相）
-2. 收客户端输入（累计击键数 `ticks`），换算成出沙
-3. 把 `grid` 的**增量变化**广播给同房间所有客户端
-4. 把 `grid` + 玩家档案**持久化到磁盘**（存档），重启 / 新人加入时恢复 / 下发
+1. 跑 falling-sand 模拟（权威），持有该房间唯一的 `grid`（= 房间真相），**裁决输入顺序**
+2. 收客户端输入（累计击键数 `ticks` / 交互事件），按 tick 钉成**有序事件流**
+3. 把这条事件流广播给同房间所有客户端（`frame`）——客户端跑同一份确定性 sim（`/sim.js`）本地重现网格
+4. 把 `grid` + 玩家档案**持久化到磁盘**，重启 / 新人加入时恢复 / 下发快照
 
-客户端**不跑物理**：只发输入、收状态、纯渲染。隐私红线：只处理计数 + 网格像素，**绝不**键位内容。
+**同步模型 = 确定性帧同步（lockstep）+ 快照兜底**（已上线；模型详见 `architecture.md`「同步模型」）：客户端**也跑**那份 sim，平时只传输入、本地即时渲染（自己的沙**零延迟预测**），服务端在背后裁决与持久化、并用周期 checksum 让客户端**自愈**。隐私红线：只处理计数 + 网格像素，**绝不**键位内容。
+
+> 兼容：未加载 `/sim.js` 的老客户端（或加 `?patch`）仍收逐格 `patch` 纯渲染；`patch`/`band` **只发**这些非 lockstep 客户端。整房可用 `SAND_EMIT_FRAMES=0` 退回纯 patch 模式。
 
 ---
 
@@ -38,10 +39,11 @@ ws://<host>/r/<roomId>?_pk=<playerId>
 ### 客户端 → 服务端
 
 ```ts
-{ type:"join",  name:"Fay", color:"auto" }  // 加入；color 由服务端分配
+{ type:"join",  name:"Fay", color:"auto", lockstep:true } // 加入；lockstep=true → 客户端跑 /sim.js（服务端不再给它发 patch）
 { type:"input", ticks: 1234 }               // 累计击键数（服务端算增量 → 出沙）
 { type:"leave" }                            // 显式退出（释放颜色名额）
 { type:"reset" }                            // 清空本房间画布 + 归档（原型：任何人可）
+{ type:"resync" }                           // lockstep 自愈：本地与服务端 checksum 不符 → 要一份新 snapshot
 { type:"spout", size: 3 }                   // 出水口画笔大小 N×N（1..5）
 { type:"pour",  on:true }                   // debug：按当前画笔持续出沙（看效果）
 { type:"flood", on:true }                   // debug：从底部实心快速灌满（测归档）
@@ -51,16 +53,22 @@ ws://<host>/r/<roomId>?_pk=<playerId>
 ### 服务端 → 客户端
 
 ```ts
-// 加入时：完整状态（含归档带 bands，见 Stage 3）
+// 加入 / 重连 / 自愈时：完整状态。除画布外还带 sim 状态，让 lockstep 客户端精确续跑
 { type:"snapshot", w:80, h:300,
   players:{ "<id>":{ name, color, ticks }, ... },
   grid:"<base64 of W*H bytes>",
-  bands:[ { rows, n, cells:"<base64 rows*W bytes>" }, ... ] }
+  bands:[ { rows, n, cells:"<base64 rows*W bytes>" }, ... ],
+  rng, frame, queues, spout, pour, flood,    // sim 状态（lockstep 热加入用；老客户端忽略）
+  lockstep:true }                            // 服务端是否在发 frame 流（=客户端是否走 lockstep）
 
-// 每 tick：变化的网格单元（扁平 [格子下标, 新值, 格子下标, 新值, ...]）
+// 每 tick：有序事件流（lockstep 主力）。events = join/leave/input(delta)/spout/pour/flood/reset
+// chk = 每 CHECKSUM_EVERY(=60) tick 一次的网格哈希，供客户端自愈比对
+{ type:"frame", tick, events:[ {op:"input", id, delta}, ... ], chk? }
+
+// 每 tick：变化的网格单元（扁平 [下标,新值,...]）——**只发非 lockstep 客户端**
 { type:"patch", c:[ idx0,val0, idx1,val1, ... ] }
 
-// Stage 3：新生成一条归档带（活动网格刚把底部 rows 行压缩归档、整体下移 rows 行）
+// Stage 3：新生成一条归档带——**只发非 lockstep 客户端**（lockstep 客户端本地自行归档）
 { type:"band", rows, n, cells:"<base64 rows*W bytes>" }
 
 // 玩家名册变化（join / leave）
@@ -75,8 +83,8 @@ ws://<host>/r/<roomId>?_pk=<playerId>
 
 - 格子值：`0`=空，`1..4`=玩家槽位（颜色）。`idx = row*W + col`。
 - **名册是合成的**：`players:{id:{name,color,ticks}}` 由服务端 `rosterForWire()` 把**世界成员**（color/ticks）与**全局玩家档案**（name）现合并而成。存储已拆成玩家档案/世界档案两套（见下），但**线协议不变**，客户端无需改动。
-- 增量优先：高频 tick 只发变化单元；`snapshot` 仅在加入时发一次。
-- `band` 是低频事件（只在压缩触发时发一条）。收到时客户端做与服务端**完全相同**的确定性下移（`grid` 整体下移 `rows` 行、顶部腾空），再把这条带追加到归档；因为是确定性的，无需重发整张 `snapshot`，稳态几乎不占带宽。
+- **lockstep 主路径**：稳态只传 `frame`（输入级，极小）；客户端本地跑 `/sim.js` 重现网格（自己的沙零延迟预测、别人的沙走小缓冲）。`snapshot` 仅加入 / 重连 / 自愈时发。`patch` 是**老客户端兼容路径**（逐格全网格 diff），只发非 lockstep 客户端。
+- `band` 低频（压缩触发时一条）。lockstep 客户端**自己**做与服务端完全相同的确定性下移 + 归档（不依赖 `band` 消息）；非 lockstep 客户端收 `band` 消息照做。两路都把归档按真实高度逐像素无损还原，相机 `cameraY += rows`、视图不动，压缩对用户透明。
 - 客户端**不做** 1px 细条特殊显示：归档带在世界坐标里按真实高度 `rows` 展开，滚动到附近时**逐像素无损**还原（`cells` = `rows*W` 精确像素，和当时一模一样），压缩对用户透明。相机随之 `cameraY += rows`，视图不动。
 
 ---
@@ -88,14 +96,17 @@ ws://<host>/r/<roomId>?_pk=<playerId>
 每个 `Room`（= 一个**世界**）：
 
 ```text
-grid     : Uint8Array(W*H)   // 唯一真相
-prev     : Uint8Array(W*H)   // 上一帧广播态，用于 diff 出 patch
-bands    : [{rows,n,cells}]  // Stage 3 归档
+sim      : SandSim            // 共享确定性 CA（/sim.js）：grid（唯一真相）+ bands + rngState（种子，持久化）
+                             //   + frame + queues + spoutSize + pouring/flooding（调试）。服务端与客户端跑同一份
+prev     : Uint8Array(W*H)   // 上一帧广播态，给**非 lockstep 客户端** diff 出 patch
 createdAt: number            // 世界创建时间
 members  : { playerId: { color, ticks, contributionTicks, joinedAt } }  // 成员名单（不存 name）
-queues   : { playerId: 待出沙粒数 }
 conns    : Map<ws, playerId>
+patchConns: Set<ws>          // 仍要逐格 patch 的连接（老 / 非 lockstep 客户端）
+pendingEvents: [ {op,...} ]  // 本 tick 的有序 sim 事件，tick 末尾广播为 frame
 ```
+
+> `grid` / `bands` 旧版直接挂在 `Room` 上；现在统一进 `Room.sim`（一个 `SandSim` 实例），`Room` 只管网络 / 持久化 / 玩家名 / diff / 广播。`rng`（PRNG 种子）随世界存盘，重启续同一条确定流（lockstep 要求）。
 
 进程级 `playerStore`（一个 `PlayerStore` 实例，所有房间共享）：
 
@@ -112,7 +123,7 @@ profile  : { id, name, createdAt, lastSeen, skills:{}, lifetime:{ticks}, worlds:
 
 ---
 
-## 模拟 / 渲染参数（服务端权威，客户端渲染共享同一约定）
+## 模拟 / 渲染参数（共享约定：服务端与客户端跑同一份 `/sim.js`）
 
 | 参数 | 值 | 说明 |
 |---|---|---|
@@ -137,7 +148,7 @@ profile  : { id, name, createdAt, lastSeen, skills:{}, lifetime:{ticks}, worlds:
 - 沙的**总量**仍 = 击键数（队列），画笔只决定**宽度/最大流速**。"按频率放大流量/水龙头开关"等是后续在此之上叠加的玩法。
 - debug：`{type:"pour"}` 让画笔满载持续出沙（看效果）；`{type:"spout",size}` 调画笔大小。
 
-物理算法（逐行自底向上，重力 + 随机左右下滑，扫描方向逐帧交替）沿用旧客户端引擎，现在跑在服务端、对所有人是同一份。
+物理算法（逐行自底向上，重力 + 随机左右下滑，扫描方向逐帧交替）抽进共享 `/sim.js`，服务端与客户端跑**同一份**。随机用**带种子 PRNG**（mulberry32，整数运算），消费顺序固定 → 同种子同输入两端逐位一致（lockstep 确定性契约，见 `architecture.md`「同步模型」）。
 
 > 测试用环境变量(覆盖上表，仅供 smoke 测试起小而快的房间；**生产用默认值**，`W/H` 是与客户端的共享契约)：`SAND_H` / `SAND_COMPRESS_ROWS` / `SAND_COMPRESS_MARGIN` / `SAND_SPOUT` / `SAND_SAVE_MS` / `SAND_DATA_DIR`。
 
