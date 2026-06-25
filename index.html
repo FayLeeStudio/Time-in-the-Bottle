@@ -867,7 +867,7 @@
   function tick() {
     if (!ctx) { ctx = canvas.getContext("2d"); ctx.imageSmoothingEnabled = false; }
     frame++;
-    if (lockOn && authSim) deriveRenderSim(); // predicted render-sim → own sand at zero latency
+    if (lockOn && authSim && renderDirty) { deriveRenderSim(); renderDirty = false; } // recompute prediction only on change (new frame / you typed) — not every frame
     // Stable surface: rise toward the pile top quickly as sand is added, but only DRIFT
     // down slowly. So the measured surface tracks the settled high-water mark and the
     // camera + spouts stay put when you're not pouring — no per-frame jitter. (smSurface
@@ -896,11 +896,11 @@
   // ---------------------------------------------------------------------------
   function applyCount(total) {
     total = Number(total) || 0;
-    if (!youBaselineSet) { myCount = total; youBaselineSet = true; pendingTicks = myCount; return; }
-    if (total > myCount) myCount = total;
+    if (!youBaselineSet) { myCount = total; youBaselineSet = true; pendingTicks = myCount; renderDirty = true; return; }
+    if (total > myCount) { myCount = total; renderDirty = true; } // you typed → repredict (own sand instant)
     pendingTicks = myCount;
   }
-  function bumpYou() { myCount++; pendingTicks = myCount; }
+  function bumpYou() { myCount++; pendingTicks = myCount; renderDirty = true; }
 
   if (TE) {
     TE.listen("keycount", function (e) { applyCount(e.payload); });
@@ -1134,7 +1134,8 @@
   let authSim = null;              // confirmed mirror: advanced only by frames, matches the server
   let frameBuf = [];               // frames awaiting playout (tick order)
   let lockOn = false;              // lockstep currently driving the render (server said it emits frames)
-  let renderSim = null;            // predicted render sim (2c) — re-derived from authSim every frame
+  let renderSim = null;            // predicted render sim (2c) — re-derived from authSim ON CHANGE (not every frame)
+  let renderDirty = false;         // prediction needs recompute? set when authSim advances or you type
   let confirmedMyCount = 0;        // grains of MINE authSim has confirmed (snapshot baseline + frame deltas)
   const PREDICT_LEAD = FRAME_BUFFER + 1; // ticks to fast-forward renderSim past authSim toward real time (tunable)
   const NO_FLOOD = {};             // never predict the debug flood
@@ -1159,6 +1160,7 @@
     authSim.step();
     const band = authSim.maybeArchive();
     if (band) { bands = authSim.bands; rebuildArchive(); smSurface += band.rows; cameraY = Math.min(maxCameraY(), cameraY + band.rows); }
+    renderDirty = true; // authSim moved → the prediction must be recomputed next frame
   }
   function driveLockstep() { while (frameBuf.length > FRAME_BUFFER) stepAuth(frameBuf.shift()); }
 
@@ -1175,7 +1177,7 @@
     if (msg.players) for (const id in msg.players) authSim.addMember(id, msg.players[id].color); // sim roster = colours
     confirmedMyCount = (msg.players && msg.players[myId] && Number(msg.players[myId].ticks)) || 0; // baseline for own-sand prediction
     grid = authSim.grid; bands = authSim.bands; rebuildArchive();
-    lockOn = true; frameBuf = [];
+    lockOn = true; frameBuf = []; renderDirty = true;
   }
   // Predicted render sim (2c): the RENDERED grid. Re-derived each frame from authSim (the
   // confirmed mirror) + MY own un-confirmed grains, fast-forwarded a few ticks so my sand
