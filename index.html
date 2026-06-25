@@ -372,6 +372,7 @@
     </div>
   </div>
 
+<script src="/sim.js"></script>
 <script>
 (function () {
   "use strict";
@@ -608,8 +609,10 @@
   const CAMERA_ANCHOR = 0.382; // pin the settled surface ~0.382 down → sand fills lower ~0.618
   const SPOUT_X = { 1: 30, 2: 50, 3: 10, 4: 70 }; // evenly spaced across W=80, centre-out (must match server)
 
-  // --- authoritative grid (mirror of the server's), updated by snapshot/patch ---
-  const grid = new Uint8Array(W * H);
+  // --- rendered grid. In patch mode it's a standalone mirror updated by snapshot/patch.
+  // In lockstep mode (Phase 2) it's reassigned to ALIAS the local sim's grid (authSim /
+  // renderSim), which the sim mutates in place. `let` so we can repoint it. ---
+  let grid = new Uint8Array(W * H);
   // Stage 3 archive. The server moves the active grid's bottom rows VERBATIM into
   // `bands` (lossless — the exact pixels). Each band lives BELOW the active grid at its
   // TRUE height (`rows` world rows) and renders identically to live sand, so scrolling
@@ -864,6 +867,7 @@
   function tick() {
     if (!ctx) { ctx = canvas.getContext("2d"); ctx.imageSmoothingEnabled = false; }
     frame++;
+    if (lockOn && authSim) deriveRenderSim(); // predicted render-sim → own sand at zero latency
     // Stable surface: rise toward the pile top quickly as sand is added, but only DRIFT
     // down slowly. So the measured surface tracks the settled high-water mark and the
     // camera + spouts stay put when you're not pouring — no per-frame jitter. (smSurface
@@ -1079,6 +1083,13 @@
     for (const id in players) if (!seen[id]) removePlayer(id);
   }
   function applySnapshot(msg) {
+    if (LOCKSTEP && msg.lockstep) {          // server emits frames → lockstep: snapshot seeds the local sim
+      buildAuthSim(msg);
+      if (msg.players) applyPlayers(msg.players);
+      smSurface = surface();
+      if (follow) cameraY = followTarget();
+      return;
+    }
     grid.fill(0);
     if (msg.grid) { const u8 = b64ToU8(msg.grid); grid.set(u8.subarray(0, W * H)); }
     bands = Array.isArray(msg.bands)
@@ -1110,6 +1121,82 @@
     cameraY = Math.min(maxCameraY(), cameraY + K);
   }
 
+  // ---------------------------------------------------------------------------
+  // Lockstep client (Phase 2): run the SAME deterministic sim as the server
+  // (/sim.js) locally, advanced by the ordered `frame` event log, and render IT.
+  // The server stays the authority (a snapshot resyncs us). `?patch` forces the old
+  // patch path; we also auto-fall-back to patch if the server isn't emitting frames
+  // (so the client can deploy before the server flips SAND_EMIT_FRAMES on).
+  // ---------------------------------------------------------------------------
+  const Sand = window.Sand || null;
+  const LOCKSTEP = !!Sand && !params.has("patch"); // sim.js present + not forced to patch via ?patch
+  const FRAME_BUFFER = 2;          // playout delay B (ticks) — absorbs jitter for OTHERS' sand
+  let authSim = null;              // confirmed mirror: advanced only by frames, matches the server
+  let frameBuf = [];               // frames awaiting playout (tick order)
+  let lockOn = false;              // lockstep currently driving the render (server said it emits frames)
+  let renderSim = null;            // predicted render sim (2c) — re-derived from authSim every frame
+  let confirmedMyCount = 0;        // grains of MINE authSim has confirmed (snapshot baseline + frame deltas)
+  const PREDICT_LEAD = FRAME_BUFFER + 1; // ticks to fast-forward renderSim past authSim toward real time (tunable)
+  const NO_FLOOD = {};             // never predict the debug flood
+
+  function applyFrameEvents(s, evs) {
+    if (!evs) return;
+    for (let i = 0; i < evs.length; i++) {
+      const ev = evs[i];
+      if (ev.op === "input") { s.enqueue(ev.id, ev.delta); if (ev.id === myId) confirmedMyCount += ev.delta; } // track MY confirmed grains → prediction baseline
+      else if (ev.op === "join") s.addMember(ev.id, ev.color);
+      else if (ev.op === "leave") s.removeMember(ev.id);
+      else if (ev.op === "spout") s.setSpout(ev.id, ev.size);
+      else if (ev.op === "pour") s.setPour(ev.id, ev.on);
+      else if (ev.op === "flood") s.setFlood(ev.id, ev.on);
+      else if (ev.op === "reset") s.reset();
+    }
+  }
+  // Advance authSim by one confirmed tick, then mirror the server's deterministic
+  // archive (same shift + camera nudge as applyBand) when it folds the bottom.
+  function stepAuth(f) {
+    applyFrameEvents(authSim, f.events);
+    authSim.step();
+    const band = authSim.maybeArchive();
+    if (band) { bands = authSim.bands; rebuildArchive(); smSurface += band.rows; cameraY = Math.min(maxCameraY(), cameraY + band.rows); }
+  }
+  function driveLockstep() { while (frameBuf.length > FRAME_BUFFER) stepAuth(frameBuf.shift()); }
+
+  function buildAuthSim(msg) {
+    authSim = new Sand.SandSim({ H: H, rngState: msg.rng >>> 0 }); // prod defaults (COMPRESS_ROWS=64 etc. match server)
+    if (msg.grid) authSim.grid.set(b64ToU8(msg.grid).subarray(0, W * H));
+    authSim.bands = Array.isArray(msg.bands) ? msg.bands.map(function (b) { const r = b.rows | 0; return { rows: r, n: b.n | 0, cells: b64ToCells(b.cells, r * W) }; }) : [];
+    authSim.frame = msg.frame | 0;
+    if (msg.queues) authSim.queues = Object.assign({}, msg.queues);
+    if (msg.spout) authSim.spoutSize = Object.assign({}, msg.spout);
+    if (msg.pour) authSim.pouring = Object.assign({}, msg.pour);
+    if (msg.flood) authSim.flooding = Object.assign({}, msg.flood);
+    authSim.members = {};
+    if (msg.players) for (const id in msg.players) authSim.addMember(id, msg.players[id].color); // sim roster = colours
+    confirmedMyCount = (msg.players && msg.players[myId] && Number(msg.players[myId].ticks)) || 0; // baseline for own-sand prediction
+    grid = authSim.grid; bands = authSim.bands; rebuildArchive();
+    lockOn = true; frameBuf = [];
+  }
+  // Predicted render sim (2c): the RENDERED grid. Re-derived each frame from authSim (the
+  // confirmed mirror) + MY own un-confirmed grains, fast-forwarded a few ticks so my sand
+  // appears the instant I type. Always re-derived from authSim, so it can't drift — the
+  // only correction is my newest few grains settling into their authoritative spot, which
+  // is sub-pixel since no one else pours into my column. Archiving stays authoritative-only
+  // (we never archive the prediction), so deep history is exact.
+  function deriveRenderSim() {
+    if (!renderSim) renderSim = new Sand.SandSim({ H: H });
+    const a = authSim, r = renderSim;
+    r.rngState = a.rngState; r.frame = a.frame;
+    r.grid.set(a.grid);
+    r.bands = a.bands;                 // share (prediction never archives → read-only here)
+    r.members = a.members; r.spoutSize = a.spoutSize; r.pouring = a.pouring; r.flooding = NO_FLOOD;
+    r.queues = Object.assign({}, a.queues);
+    const predicted = myCount - confirmedMyCount;
+    if (predicted > 0 && myId) r.enqueue(myId, predicted);
+    for (let i = 0; i < PREDICT_LEAD; i++) r.step();
+    grid = r.grid; bands = r.bands;
+  }
+
   let ws = null, reconnectTimer = null, roomFull = false;
   function setLive(ok) { if (liveDot) liveDot.classList.toggle("off", !ok); }
   function showRoomFull() {
@@ -1127,8 +1214,9 @@
     let data; try { data = JSON.parse(e.data); } catch (_) { return; }
     if (!data) return;
     if (data.type === "snapshot") applySnapshot(data);
-    else if (data.type === "patch") applyPatch(data.c);
-    else if (data.type === "band") applyBand(data);
+    else if (data.type === "frame") { if (lockOn) { frameBuf.push(data); driveLockstep(); } }
+    else if (data.type === "patch") { if (!lockOn) applyPatch(data.c); }   // ignored while the local sim drives
+    else if (data.type === "band") { if (!lockOn) applyBand(data); }       // ditto (authSim archives itself)
     else if (data.type === "players") applyPlayers(data.players || {});
     else if (data.type === "error") { if (data.reason === "room_full") showRoomFull(); }
     else if (data.type === "pong" && PERF) { perf.rtt = performance.now() - data.t; return; }
@@ -1176,6 +1264,7 @@
   // ---------------------------------------------------------------------------
   function updateRoomLabel() { if (roomCodeEl) roomCodeEl.textContent = roomId; }
   function clearRoomLocal() {
+    if (authSim) { authSim = null; renderSim = null; confirmedMyCount = 0; lockOn = false; frameBuf = []; grid = new Uint8Array(W * H); }
     grid.fill(0); bands = []; rebuildArchive();
     for (const id in players) removePlayer(id);
     cameraY = H - viewRows; follow = true; smSurface = H;

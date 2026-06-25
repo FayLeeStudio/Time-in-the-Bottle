@@ -11,6 +11,8 @@
     "migrate": "node server/migrate.mjs",
     "test:determinism": "node server/determinism.test.mjs",
     "test:replay": "node server/replay.test.mjs",
+    "test:predict": "node server/predict.test.mjs",
+    "test:lockstep": "node server/lockstep.test.mjs",
     "test:bands": "node server/smoke-bands.mjs"
   },
   "devDependencies": {

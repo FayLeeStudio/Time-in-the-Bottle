@@ -315,6 +315,13 @@ class Room {
         players: this.rosterForWire(),
         grid: Buffer.from(this.sim.grid).toString("base64"),
         bands: this.serializeBands(),
+        // Full sim state so a client running /sim.js resumes deterministically (lockstep
+        // hot-join): PRNG stream position + tick + pour queues + brush/debug toggles.
+        // Additive — old clients ignore these. Privacy: counts/sizes/bools only, no text.
+        rng: this.sim.rngState, frame: this.sim.frame,
+        queues: this.sim.queues, spout: this.sim.spoutSize,
+        pour: this.sim.pouring, flood: this.sim.flooding,
+        lockstep: EMIT_FRAMES, // tell the client whether to expect the `frame` stream (run lockstep) vs render patches
       }));
     } catch (_) {}
   }
