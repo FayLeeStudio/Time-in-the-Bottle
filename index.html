@@ -263,6 +263,29 @@
   }
   .menu-brush button.on { color: #0a0a0a; background: var(--color-accent); }
   .menu-item.on { color: #0a0a0a; background: var(--color-accent); }
+  /* debug header (label + Switch) and the collapsible body it toggles */
+  .menu-debug-head { display: flex; align-items: center; justify-content: space-between; }
+  .menu-debug-body { display: flex; flex-direction: column; gap: 2px; margin-top: 4px; }
+  .menu-debug-body[hidden] { display: none; }
+  .switch {
+    flex: none; width: 32px; height: 18px; padding: 0;
+    border: none; border-radius: 9px; cursor: pointer; position: relative;
+    background: rgba(255,255,255,.18); transition: background .15s ease;
+  }
+  .switch[aria-checked="true"] { background: var(--color-accent); }
+  .switch > i {
+    position: absolute; top: 2px; left: 2px;
+    width: 14px; height: 14px; border-radius: 50%;
+    background: #fff; transition: left .15s ease;
+  }
+  .switch[aria-checked="true"] > i { left: 16px; }
+  /* perf readout — moved off the canvas into here so it never covers the buttons */
+  .menu-perf {
+    margin: 4px 0 0; padding: 5px 6px;
+    font: 10px/1.45 'JetBrains Mono', monospace;
+    color: var(--color-accent); background: rgba(0,0,0,.35);
+    border-radius: 5px; white-space: pre-wrap;
+  }
 
   /* ---- standalone menu popover window (#menu) ------------------------ */
   /* This page is loaded a SECOND time in its own frameless, transparent Tauri
@@ -273,9 +296,8 @@
   html.menumode .bar, html.menumode .bottle-wrap { display: none; }
   html.menumode .menu {
     position: static; right: auto; top: auto;
-    width: 100%; min-height: 100vh;
+    width: 100%; min-height: 0;            /* height follows content; JS fits the window to it */
     border: none; border-radius: 10px;
-    overflow-y: auto;
   }
   html.menumode .menu[hidden] { display: flex; }   /* this window IS the menu — always shown */
 
@@ -322,10 +344,16 @@
 
         <div class="menu-sep" id="debugSep" hidden></div>
         <div class="menu-debug" id="debugRow" hidden>
-          <div class="menu-label">debug · fill</div>
-          <div class="menu-brush" id="brushRow"><span class="menu-brush-tag">spout</span></div>
-          <button class="menu-item" id="pourBtn">💧 pour continuously</button>
-          <button class="menu-item" id="floodBtn">⏬ flood-fill (archive test)</button>
+          <div class="menu-debug-head">
+            <span class="menu-label">debug</span>
+            <button class="switch" id="debugSwitch" role="switch" aria-checked="false" aria-label="debug panel"><i></i></button>
+          </div>
+          <div class="menu-debug-body" id="debugBody" hidden>
+            <div class="menu-brush" id="brushRow"><span class="menu-brush-tag">spout</span></div>
+            <button class="menu-item" id="pourBtn">💧 pour continuously</button>
+            <button class="menu-item" id="floodBtn">⏬ flood-fill (archive test)</button>
+            <pre class="menu-perf" id="perfBox">—</pre>
+          </div>
         </div>
 
         <div class="menu-sep"></div>
@@ -379,9 +407,12 @@
   const editSave   = $("editSave");
   const debugSep   = $("debugSep");
   const debugRow   = $("debugRow");
+  const debugSwitch= $("debugSwitch");
+  const debugBody  = $("debugBody");
   const brushRow   = $("brushRow");
   const pourBtn    = $("pourBtn");
   const floodBtn   = $("floodBtn");
+  const perfBox    = $("perfBox");
 
   // Tauri APIs exist only inside the shell. The shell feeds a global input COUNT
   // via the 'keycount' event (counting happens only in Rust — CLAUDE.md §3); the
@@ -402,7 +433,7 @@
   // (menu:state) so its toggles read right, and applied to the WS as flood/pour/spout.
   const dbg = { flood: false, pour: false, spout: 1 };
   const perf = PERF ? { frames: 0, patches: 0, bytes: 0, cells: 0, peakCells: 0, parseMs: 0, drawMs: 0, rtt: 0, t0: 0 } : null;
-  let perfEl = null;
+  let perfLine = "";
 
   // Objective identity palette: grid cells hold a slot 1..4 (0 = empty). Colour
   // is assigned by the server and identical on every client. "Which one is me" is
@@ -429,6 +460,17 @@
     const selfWin = (TW && TW.getCurrentWindow) ? TW.getCurrentWindow() : null;
     function selfHide() { try { if (selfWin && selfWin.hide) selfWin.hide(); } catch (_) {} }
     function emitCmd(p) { if (TE && TE.emit) TE.emit("menu:cmd", p); }
+    // Fit the popover window to its content height, so exit is never clipped and the
+    // window shrinks back when the debug panel is collapsed. Width stays as configured.
+    const MENU_W = 260;                          // matches tauri.conf "menu" window width
+    let lastFitH = 0;
+    function fitHeight() {
+      if (!selfWin || !TW || !TW.LogicalSize || !selfWin.setSize) return;
+      requestAnimationFrame(function () {
+        const h = Math.ceil(menu.getBoundingClientRect().height);
+        if (h && h !== lastFitH) { lastFitH = h; try { selfWin.setSize(new TW.LogicalSize(MENU_W, h)); } catch (_) {} }
+      });
+    }
     function copyToClipboard(t) {
       if (!t) return;                            // we have the button's user-activation here,
       function fallback() {                      // so clipboard writes are reliable (unlike the
@@ -466,16 +508,18 @@
         rankingEl.appendChild(row);
       }
       // debug section: only the App (?debug=1) pushes s.debug; mirror the live
-      // flood/pour/spout state so the toggles read right even after a reopen.
+      // flood/pour/spout state + perf readout so they read right even after a reopen.
       const on = !!s.debug;
       debugSep.hidden = !on; debugRow.hidden = !on;
       if (on) {
-        const dbg = s.dbg || {};
-        pourBtn.classList.toggle("on", !!dbg.pour);
-        floodBtn.classList.toggle("on", !!dbg.flood);
-        const sz = dbg.spout || 1;
+        const d = s.dbg || {};
+        pourBtn.classList.toggle("on", !!d.pour);
+        floodBtn.classList.toggle("on", !!d.flood);
+        const sz = d.spout || 1;
         for (const b of brushRow.querySelectorAll("button")) b.classList.toggle("on", +b.dataset.size === sz);
+        perfBox.textContent = s.perf || "—";
       }
+      fitHeight();                                 // window follows content (ranking + debug panel)
     }
 
     if (TE && TE.listen) TE.listen("menu:state", function (e) { try { render(e.payload || {}); } catch (_) {} });
@@ -509,6 +553,15 @@
     });
     resetBtn.addEventListener("click", function () { emitCmd({ action: "reset" }); selfHide(); });
     exitBtn.addEventListener("click", function () { if (TE && TE.emit) TE.emit("app:exit"); });
+
+    // debug panel Switch: collapsed by default (keeps the menu short); tap to reveal
+    // the fill tools + perf readout, tap again to hide. The window refits each time.
+    debugSwitch.addEventListener("click", function () {
+      const open = debugSwitch.getAttribute("aria-checked") !== "true";
+      debugSwitch.setAttribute("aria-checked", open ? "true" : "false");
+      debugBody.hidden = !open;
+      fitHeight();
+    });
 
     // debug controls — emit intents; the App owns the WS and forwards them + reflects
     // the resulting state back via menu:state (so we don't track truth here).
@@ -916,6 +969,12 @@
   // so wire the SAME controls into the inline menu and talk to the WS directly.
   if (DEBUG && !TE) {
     debugSep.hidden = false; debugRow.hidden = false;
+    debugSwitch.addEventListener("click", function (e) {
+      e.stopPropagation();
+      const open = debugSwitch.getAttribute("aria-checked") !== "true";
+      debugSwitch.setAttribute("aria-checked", open ? "true" : "false");
+      debugBody.hidden = !open;
+    });
     const send = function (m) { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(m)); };
     const sync = function () {
       pourBtn.classList.toggle("on", dbg.pour);
@@ -931,6 +990,7 @@
     pourBtn.addEventListener("click", function (e) { e.stopPropagation(); dbg.pour = !dbg.pour; send({ type: "pour", on: dbg.pour }); sync(); });
     floodBtn.addEventListener("click", function (e) { e.stopPropagation(); dbg.flood = !dbg.flood; send({ type: "flood", on: dbg.flood }); sync(); });
     sync();
+    setInterval(function () { perfBox.textContent = perfLine || "—"; }, 1000);
   }
   resetBtn.addEventListener("click", function () {
     // server-authoritative: ask the server to empty the room's canvas (browser inline path)
@@ -1160,13 +1220,11 @@
     else if (e.key === "Escape") editRow.hidden = true;
   });
 
-  // --- perf HUD (diagnostic; only when ?perf=1 / #perf) ---
+  // --- perf sampling (diagnostic; only when ?perf=1 / #perf / ?debug=1) ---
+  // The readout no longer floats over the canvas (it covered the bottom buttons);
+  // the sampled line is pushed to the menu popover's debug panel via menu:state.
   function startPerf() {
     if (!PERF) return;
-    perfEl = document.createElement("div");
-    perfEl.style.cssText = "position:fixed;left:4px;bottom:4px;z-index:9999;font:10px/1.45 'JetBrains Mono',monospace;" +
-      "color:#7fffd4;background:rgba(0,0,0,.66);padding:4px 6px;white-space:pre;pointer-events:none;max-width:96vw;border-radius:4px";
-    document.body.appendChild(perfEl);
     perf.t0 = performance.now();
     setInterval(function () {
       if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "ping", t: performance.now() }));
@@ -1176,13 +1234,11 @@
       const avgC = perf.patches ? perf.cells / perf.patches : 0;
       const drawMs = perf.frames ? perf.drawMs / perf.frames : 0;
       const parseMs = perf.patches ? perf.parseMs / perf.patches : 0;
-      const line =
+      perfLine =
         "fps " + fps.toFixed(0) + "  draw " + drawMs.toFixed(2) + "ms/f\n" +
         pps.toFixed(0) + " patch/s  ~" + avgB.toFixed(0) + "B/" + avgC.toFixed(0) + "cells (peak " + perf.peakCells + ")\n" +
         "parse+apply " + parseMs.toFixed(2) + "ms  rtt " + perf.rtt.toFixed(0) + "ms\n" +
         "grains " + gridGrains() + "  bands " + bands.length;
-      perfEl.textContent = line;
-      console.log("[perf] " + line.replace(/\n/g, " | "));
       perf.frames = perf.patches = perf.bytes = perf.cells = perf.peakCells = perf.parseMs = perf.drawMs = 0;
       perf.t0 = performance.now();
     }, 1000);
@@ -1202,7 +1258,8 @@
     }
     list.sort(function (a, b) { return b.count - a.count; });
     return { players: list, buried: buriedCount(), room: roomId, link: shareLink(),
-             debug: DEBUG, dbg: { flood: dbg.flood, pour: dbg.pour, spout: dbg.spout } };
+             debug: DEBUG, dbg: { flood: dbg.flood, pour: dbg.pour, spout: dbg.spout },
+             perf: PERF ? perfLine : "" };
   }
   function startMenuBridge() {
     if (!TE) return;                       // browser dev has no shell event bus

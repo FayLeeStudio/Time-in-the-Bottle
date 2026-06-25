@@ -7,6 +7,20 @@ use std::sync::{
 use rdev::{listen, EventType};
 use tauri::{DeviceEventFilter, Emitter, Listener, Manager};
 
+// Glue the menu popover to the bottle: park it just left of the main window,
+// top-aligned, clamped on-screen. Called on open and whenever the bottle moves.
+fn place_menu(app: &tauri::AppHandle) {
+  if let (Some(main), Some(menu)) = (
+    app.get_webview_window("main"),
+    app.get_webview_window("menu"),
+  ) {
+    if let (Ok(p), Ok(ms)) = (main.outer_position(), menu.outer_size()) {
+      let x = (p.x - ms.width as i32 - 8).max(0);
+      let _ = menu.set_position(tauri::PhysicalPosition::new(x, p.y));
+    }
+  }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   // Shared running total of inputs (keystrokes + mouse clicks).
@@ -76,29 +90,37 @@ pub fn run() {
         }
       }
 
+      // Keep the popover glued to the bottle while you drag the main window — it's a
+      // child of the bottle, so it should move in lockstep (only while it's open).
+      if let Some(main) = handle.get_webview_window("main") {
+        let move_h = handle.clone();
+        main.on_window_event(move |ev| {
+          if let tauri::WindowEvent::Moved(_) = ev {
+            if let Some(menu) = move_h.get_webview_window("menu") {
+              if menu.is_visible().unwrap_or(false) {
+                place_menu(&move_h);
+              }
+            }
+          }
+        });
+      }
+
       // ---- menu popover window (separate frameless window; tauri.conf visible:false) ----
       // The bar's ≡ emits "menu:toggle": tap to open, tap again to close. It deliberately
       // does NOT hide on blur — so you can drag the bottle or click elsewhere while the menu
       // stays open; only another ≡ tap closes it. "app:exit" (menu's exit) quits the app.
       let open_h = handle.clone();
       handle.listen_any("menu:toggle", move |_| {
-        let (main, menu) = match (
-          open_h.get_webview_window("main"),
-          open_h.get_webview_window("menu"),
-        ) {
-          (Some(m), Some(n)) => (m, n),
-          _ => return,
+        let menu = match open_h.get_webview_window("menu") {
+          Some(n) => n,
+          None => return,
         };
         // tap-again-to-close: if the popover is already up, just hide it
         if menu.is_visible().unwrap_or(false) {
           let _ = menu.hide();
           return;
         }
-        // place the popover just left of the bottle window, top-aligned, clamped on-screen
-        if let (Ok(p), Ok(ms)) = (main.outer_position(), menu.outer_size()) {
-          let x = (p.x - ms.width as i32 - 8).max(0);
-          let _ = menu.set_position(tauri::PhysicalPosition::new(x, p.y));
-        }
+        place_menu(&open_h);            // park it beside the bottle, then reveal
         let _ = menu.show();
         let _ = menu.set_focus();
       });
