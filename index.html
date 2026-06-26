@@ -449,10 +449,10 @@
   // identity colour. The slot id on the wire is a NAME (COLOR_NAMES below = server ROOM_COLORS);
   // these rgb/css are only how slot 1..4 paint at ground level.
   const USER_COLORS = [
-    { css: "#53ccd3", rgb: [83, 204, 211]  }, // slot 1
-    { css: "#92d6d8", rgb: [146, 214, 216] }, // slot 2
-    { css: "#d6e0d9", rgb: [214, 224, 217] }, // slot 3
-    { css: "#f0d5b7", rgb: [240, 213, 183] }, // slot 4
+    { css: "#f0d5b7", rgb: [240, 213, 183] }, // slot 1 — sand (default/solo spout reads as sand)
+    { css: "#40bac6", rgb: [64, 186, 198]  }, // slot 2 — sea, deep
+    { css: "#a6dee0", rgb: [166, 222, 224] }, // slot 3 — sea, light
+    { css: "#d6e0d9", rgb: [214, 224, 217] }, // slot 4 — foam (pale grey-green)
   ];
   // wire slot-ids (MUST match server ROOM_COLORS in sim.js) — these are NOT the rendered hue
   const COLOR_NAMES = ["amber", "teal", "violet", "rose"];
